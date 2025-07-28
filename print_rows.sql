@@ -1,3 +1,7 @@
+# The Snowpark package is required for Python Worksheets. 
+# You can add more packages by selecting them using the Packages control and then importing them.
+
+import snowflake.snowpark as snowpark
 import pandas as pd
 from snowflake.snowpark import Session
 from snowflake.snowpark.functions import col
@@ -217,9 +221,10 @@ class GenericTableValidator:
             count_result = self.session.sql(table1_only_count_sql).collect()
             table1_only_count = count_result[0]['COUNT_ONLY']
             if table1_only_count > 0:
-                table1_only_cols = ", ".join([f"t1.{col}" for col in pk_columns])
+                # table1_only_cols = ", ".join([f"t1.{col}" for col in pk_columns])
+                # SELECT {table1_only_cols}
                 table1_only_sql = f"""
-                SELECT {table1_only_cols}
+                SELECT t1.* 
                 FROM temp_table1 t1
                 LEFT JOIN temp_table2 t2 ON {pk_join_condition}
                 WHERE t2.{pk_columns[0]} IS NULL
@@ -240,9 +245,10 @@ class GenericTableValidator:
             count_result = self.session.sql(table2_only_count_sql).collect()
             table2_only_count = count_result[0]['COUNT_ONLY']
             if table2_only_count > 0:
-                table2_only_cols = ", ".join([f"t2.{col}" for col in pk_columns])
+                # table2_only_cols = ", ".join([f"t2.{col}" for col in pk_columns])
+                # SELECT {table2_only_cols}
                 table2_only_sql = f"""
-                SELECT {table2_only_cols}
+                SELECT t2.*
                 FROM temp_table2 t2
                 LEFT JOIN temp_table1 t1 ON {pk_join_condition}
                 WHERE t1.{pk_columns[0]} IS NULL
@@ -427,6 +433,329 @@ class GenericTableValidator:
         }
         return results
 
-    # The rest of the class remains unchanged (print_sample_mismatches, print_validation_report, validate_tables_sp, etc.)
+    def print_sample_mismatches(self, table1_name: str, table2_name: str,
+                               primary_key_columns: Optional[List[str]] = None,
+                               table1_alias: str = "SQL", 
+                               table2_alias: str = "MDP",
+                               sample_size: int = 10) -> List[Dict]:
+        """
+        Print sample mismatches for verification
+        
+        Args:
+            table1_name: Name of first table
+            table2_name: Name of second table
+            primary_key_columns: List of columns to use as primary keys
+            table1_alias: Alias for first table
+            table2_alias: Alias for second table
+            sample_size: Number of sample mismatches to show
+            
+        Returns:
+            List of sample mismatch records
+        """
+        print(f"\n SAMPLE MISMATCHES VERIFICATION ({sample_size} samples)")
+        print("="*70)
+        
+        sample_mismatches = []
+        
+        try:
+            # Get table information
+            table1_info = self.get_table_info(table1_name)
+            table2_info = self.get_table_info(table2_name)
+            
+            if not table1_info or not table2_info:
+                print(" Error: Could not get table information")
+                return sample_mismatches
+            
+            # Get common columns and primary keys
+            table1_cols = [col.upper() for col in table1_info['column_names']]
+            table2_cols = [col.upper() for col in table2_info['column_names']]
+            common_columns = list(set(table1_cols) & set(table2_cols))
+            
+            pk_columns = self.identify_primary_key_columns(table1_info, table2_info, primary_key_columns)
+            if not pk_columns:
+                print(" Error: No valid primary key columns identified")
+                return sample_mismatches
+            
+            # Create temporary views
+            table1_df = self.session.table(table1_name)
+            table2_df = self.session.table(table2_name)
+            table1_df.create_or_replace_temp_view("temp_sample_table1")
+            table2_df.create_or_replace_temp_view("temp_sample_table2")
+            
+            # Build primary key join condition
+            pk_join_conditions = []
+            for col in pk_columns:
+                pk_join_conditions.append(f"COALESCE(CAST(t1.{col} AS STRING), 'NULL') = COALESCE(CAST(t2.{col} AS STRING), 'NULL')")
+            pk_join_condition = " AND ".join(pk_join_conditions)
+            
+            # Select first 5 non-PK columns for comparison
+            comparison_columns = [col for col in common_columns if col not in pk_columns][:5]
+            
+            if not comparison_columns:
+                print(" Error: No columns available for comparison")
+                return sample_mismatches
+            
+            # Build select and comparison conditions
+            select_columns = []
+            comparison_conditions = []
+            
+            # Add primary key columns
+            for col in pk_columns:
+                select_columns.append(f"t1.{col}")
+            
+            # Add comparison columns with both table values
+            for col in comparison_columns:
+                select_columns.extend([f"t1.{col} as {table1_alias}_{col}", f"t2.{col} as {table2_alias}_{col}"])
+                comparison_conditions.append(f"(COALESCE(CAST(t1.{col} AS STRING), 'NULL') != COALESCE(CAST(t2.{col} AS STRING), 'NULL'))")
+            
+            # Build sample mismatch query
+            sample_sql = f"""
+            SELECT {', '.join(select_columns)}
+            FROM temp_sample_table1 t1
+            INNER JOIN temp_sample_table2 t2 ON {pk_join_condition}
+            WHERE {' OR '.join(comparison_conditions)}
+            LIMIT {sample_size}
+            """
+            
+            result = self.session.sql(sample_sql)
+            sample_df = result.to_pandas()
+            
+            if len(sample_df) == 0:
+                print(" No mismatches found in sample data - tables appear to match!")
+                return sample_mismatches
+            
+            print(f"Found {len(sample_df)} sample mismatches:\n")
+            
+            # Process and display each sample
+            for idx, row in sample_df.iterrows():
+                # Extract primary key values
+                pk_values = {}
+                for col in pk_columns:
+                    pk_values[col] = row[col]
+                
+                print(f"Sample {idx + 1}:")
+                print(f"  Primary Key: {', '.join([f'{k}={v}' for k, v in pk_values.items()])}")
+                
+                # Check each comparison column for differences
+                differences_found = []
+                for col in comparison_columns:
+                    table1_val = row.get(f'{table1_alias}_{col}')
+                    table2_val = row.get(f'{table2_alias}_{col}')
+                    
+                    # Check if values are different
+                    if pd.isna(table1_val) and pd.isna(table2_val):
+                        continue  # Both are null, no difference
+                    elif pd.isna(table1_val) or pd.isna(table2_val) or str(table1_val) != str(table2_val):
+                        differences_found.append({
+                            'column': col,
+                            'table1_value': table1_val if pd.notna(table1_val) else 'NULL',
+                            'table2_value': table2_val if pd.notna(table2_val) else 'NULL'
+                        })
+                        print(f"    ✓ {col}: {table1_alias}='{table1_val}' vs {table2_alias}='{table2_val}'")
+                
+                # Store sample record
+                sample_record = {
+                    **pk_values,
+                    'differences': differences_found,
+                    'total_differences': len(differences_found)
+                }
+                sample_mismatches.append(sample_record)
+                print()  # Add blank line between samples
+            
+            print(f" Verification complete! Found {len(sample_mismatches)} records with differences.")
+            print(f" Columns compared: {', '.join(comparison_columns)}")
+            print(f" Primary keys used: {', '.join(pk_columns)}")
+            
+        except Exception as e:
+            self.logger.error(f"Error during sample verification: {str(e)}")
+            print(f" Error during sample verification: {str(e)}")
+        
+        return sample_mismatches
 
-# ... rest of the file unchanged ...
+    def print_validation_report(self, results: Dict[str, Any]):
+        """
+        Print a comprehensive validation report
+        
+        Args:
+            results: Results dictionary from validation
+        """
+        print("\n" + "="*80)
+        print("COMPREHENSIVE TABLE VALIDATION REPORT")
+        print("="*80)
+        print(f"Timestamp: {results['timestamp']}")
+        print(f"Environment: {results['environment']}")
+        print(f"Validation Status: {results['validation_status']}")
+        
+        stats = results['summary_statistics']
+        print(f"\nTable Information:")
+        print(f"  {stats['table1_alias']} Table: {stats['table1_name']}")
+        print(f"    - Row Count: {stats['total_table1_rows']:,}")
+        print(f"  {stats['table2_alias']} Table: {stats['table2_name']}")
+        print(f"    - Row Count: {stats['total_table2_rows']:,}")
+        
+        summary = results['results_summary']
+        table1_alias = stats['table1_alias']
+        table2_alias = stats['table2_alias']
+        
+        print(f"\nValidation Results:")
+        print(f"  Data Mismatches: {summary['mismatched_rows_count']:,}")
+        print(f"  Rows only in {table1_alias}: {summary[f'{table1_alias}_only_rows_count']:,}")
+        print(f"  Rows only in {table2_alias}: {summary[f'{table2_alias}_only_rows_count']:,}")
+        print(f"  Total Issues Found: {summary['total_issues_found']:,}")
+        
+        if results.get('validation_issues'):
+            print(f"\nValidation Issues:")
+            for issue in results['validation_issues']:
+                print(f"  - {issue['type']}: {issue.get('missing_columns', 'N/A')} ({issue['severity']})")
+        
+        if results.get('created_tables'):
+            print(f"\nCreated Snowflake Tables:")
+            for table_type, table_name in results['created_tables'].items():
+                print(f"  {table_type}: {table_name}")
+        
+        print(f"\nSnowflake Stage Files:")
+        for file_type, filepath in results['stage_files'].items():
+            print(f"  {file_type}: {filepath}")
+        
+        print(f"\nComparison Details:")
+        print(f"  Primary Key Columns: {', '.join(stats['primary_key_columns'])}")
+        print(f"  Total Common Columns: {stats['total_common_columns']}")
+        print(f"  Validation Date: {stats['validation_date']}")
+        
+        # Add note about sampling
+        if 'note' in stats:
+            print(f"\n Note: {stats['note']}")
+        
+        # Show verification option
+        print(f"\n" + "="*80)
+        print("VERIFICATION OPTIONS")
+        print("="*80)
+        print("To verify the results are working correctly:")
+        print("1. Run: validator.print_sample_mismatches(table1, table2, pk_columns, alias1, alias2, 10)")
+        print("2. This will show 10 actual mismatches with details for manual verification")
+
+
+def validate_tables_sp(session: Session, 
+                      table1_name: str, 
+                      table2_name: str,
+                      primary_key_columns: str = None,
+                      table1_alias: str = "SQL",
+                      table2_alias: str = "MDP", 
+                      environment: str = "SNOWFLAKE",
+                      create_tables: bool = True,
+                      stage_name: str = "@~/") -> str:
+    """
+    Stored procedure version of comprehensive table validation
+    
+    Args:
+        session: Snowpark session
+        table1_name: Fully qualified name of first table
+        table2_name: Fully qualified name of second table
+        primary_key_columns: Comma-separated list of primary key column names
+        table1_alias: Alias for first table (default: SQL for dev)
+        table2_alias: Alias for second table (default: MDP for prod)
+        environment: Database environment
+        create_tables: Whether to create result tables
+        stage_name: Snowflake stage for output files
+    
+    Returns:
+        Validation results summary as string
+    """
+    try:
+        # Parse primary key columns
+        pk_columns = None
+        if primary_key_columns:
+            pk_columns = [col.strip().upper() for col in primary_key_columns.split(',')]
+        
+        # Create validator
+        validator = GenericTableValidator(session)
+        
+        # Run comprehensive validation
+        results = validator.validate_tables(
+            table1_name=table1_name,
+            table2_name=table2_name,
+            primary_key_columns=pk_columns,
+            table1_alias=table1_alias,
+            table2_alias=table2_alias,
+            environment=environment,
+            create_tables=create_tables,
+            stage_name=stage_name
+        )
+        
+        if results:
+            summary = results['results_summary']
+            stats = results['summary_statistics']
+            table1_alias = stats['table1_alias']
+            table2_alias = stats['table2_alias']
+            
+            return f"""
+                    Table Validation {results['validation_status']}
+                    Environment: {results['environment']}
+                    {table1_alias} ({stats['table1_name']}): {stats['total_table1_rows']:,} rows
+                    {table2_alias} ({stats['table2_name']}): {stats['total_table2_rows']:,} rows
+                    Mismatches: {summary['mismatched_rows_count']:,}
+                    {table1_alias} Only: {summary[f'{table1_alias}_only_rows_count']:,}
+                    {table2_alias} Only: {summary[f'{table2_alias}_only_rows_count']:,}
+                    Total Issues: {summary['total_issues_found']:,}
+                    Primary Keys: {', '.join(stats['primary_key_columns'])}
+                    Common Columns: {stats['total_common_columns']}
+                                """.strip()
+        else:
+            return "Table validation failed to complete"
+            
+    except Exception as e:
+        return f"Error during table validation: {str(e)}"
+
+
+def main():
+    """
+    Main function for testing the generic table validator
+    """
+    try:
+        validator = GenericTableValidator()
+        
+        # Smple mismatches
+        print(" STEP 1: Verifying script functionality with sample mismatches...")
+        sample_mismatches = validator.print_sample_mismatches(
+            table1_name='BCBSND_CONFORMED_DEV.OUTBOUND.MEMBER_ENROLLMENT_MASTER',
+            table2_name='BCBSND_CONFORMED_DEV.OUTBOUND.MEMBER_ENROLLMENT_MASTER_PROD',
+            primary_key_columns=['MEMBER_ID'],
+            table1_alias='SQL',
+            table2_alias='MDP',
+            sample_size=15
+        )
+        
+        # If found sample mismatches, proceed with full validation
+        if sample_mismatches:
+            print(f"\n STEP 2: Running full validation (found {len(sample_mismatches)} sample mismatches)...")
+            
+            results = validator.validate_tables(
+                table1_name='BCBSND_CONFORMED_DEV.OUTBOUND.MEMBER_ENROLLMENT_MASTER',
+                table2_name='BCBSND_CONFORMED_DEV.OUTBOUND.MEMBER_ENROLLMENT_MASTER_PROD',
+                primary_key_columns=['MEMBER_ID'],
+                table1_alias='SQL',
+                table2_alias='MDP',
+                environment='SNOWFLAKE',
+                create_tables=False,
+                stage_name='@~/'
+            )
+            
+            if results:
+                validator.print_validation_report(results)
+                return results
+            else:
+                print(" Full validation failed to complete")
+                return None
+        else:
+            print(" No mismatches found in sample - tables appear to match perfectly!")
+            print("You can still run the full validation if needed.")
+            return {'status': 'no_mismatches_in_sample'}
+            
+    except Exception as e:
+        print(f" Error during validation: {str(e)}")
+        logging.error(f"Validation error: {str(e)}")
+        return None
+
+
+if __name__ == "__main__":
+    main()
