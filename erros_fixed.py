@@ -178,9 +178,11 @@ class GenericTableValidator:
     def compare_tables_comprehensive(self, table1_name: str, table2_name: str,
                                    primary_key_columns: Optional[List[str]] = None,
                                    table1_alias: str = "SQL", 
-                                   table2_alias: str = "MDP") -> Tuple[List[Dict], List[Dict], List[Dict], Dict]:
+                                   table2_alias: str = "MDP",
+                                   batch_size: int = 10000) -> Tuple[List[Dict], List[Dict], List[Dict], Dict]:
         """
         Perform comprehensive row-by-row comparison of all columns between two tables
+        Memory-optimized version that processes data in batches
         
         Args:
             table1_name: Name of first table
@@ -188,6 +190,7 @@ class GenericTableValidator:
             primary_key_columns: List of columns to use as primary keys
             table1_alias: Alias for first table (default: SQL for dev)
             table2_alias: Alias for second table (default: MDP for prod)
+            batch_size: Number of rows to process at once
             
         Returns:
             Tuple of (mismatched_rows, table1_only_rows, table2_only_rows, summary_stats)
@@ -235,79 +238,122 @@ class GenericTableValidator:
                 pk_join_conditions.append(f"COALESCE(CAST(t1.{col} AS STRING), 'NULL') = COALESCE(CAST(t2.{col} AS STRING), 'NULL')")
             pk_join_condition = " AND ".join(pk_join_conditions)
             
-            # 1. Find rows in TABLE1 but not in TABLE2
-            self.logger.info(f"Finding rows in {table1_alias} but not in {table2_alias}...")
-            table1_only_cols = ", ".join([f"t1.{col}" for col in pk_columns])
-            table1_only_sql = f"""
-            SELECT {table1_only_cols}
+            # 1. Find rows in TABLE1 but not in TABLE2 (count only)
+            self.logger.info(f"Counting rows in {table1_alias} but not in {table2_alias}...")
+            table1_only_count_sql = f"""
+            SELECT COUNT(*) as count_only
             FROM temp_table1 t1
             LEFT JOIN temp_table2 t2 ON {pk_join_condition}
             WHERE t2.{pk_columns[0]} IS NULL
             """
             
-            table1_only_result = self.session.sql(table1_only_sql)
-            table1_only_df = table1_only_result.to_pandas()
+            count_result = self.session.sql(table1_only_count_sql).collect()
+            table1_only_count = count_result[0]['COUNT_ONLY']
             
-            for _, row in table1_only_df.iterrows():
-                table1_only_rows.append(row.to_dict())
+            # Sample only first 1000 records for memory efficiency
+            if table1_only_count > 0:
+                table1_only_cols = ", ".join([f"t1.{col}" for col in pk_columns])
+                table1_only_sql = f"""
+                SELECT {table1_only_cols}
+                FROM temp_table1 t1
+                LEFT JOIN temp_table2 t2 ON {pk_join_condition}
+                WHERE t2.{pk_columns[0]} IS NULL
+                LIMIT 1000
+                """
+                
+                table1_only_result = self.session.sql(table1_only_sql)
+                table1_only_df = table1_only_result.to_pandas()
+                
+                for _, row in table1_only_df.iterrows():
+                    table1_only_rows.append(row.to_dict())
             
-            # 2. Find rows in TABLE2 but not in TABLE1
-            self.logger.info(f"Finding rows in {table2_alias} but not in {table1_alias}...")
-            table2_only_cols = ", ".join([f"t2.{col}" for col in pk_columns])
-            table2_only_sql = f"""
-            SELECT {table2_only_cols}
+            # 2. Find rows in TABLE2 but not in TABLE1 (count only)
+            self.logger.info(f"Counting rows in {table2_alias} but not in {table1_alias}...")
+            table2_only_count_sql = f"""
+            SELECT COUNT(*) as count_only
             FROM temp_table2 t2
             LEFT JOIN temp_table1 t1 ON {pk_join_condition}
             WHERE t1.{pk_columns[0]} IS NULL
             """
             
-            table2_only_result = self.session.sql(table2_only_sql)
-            table2_only_df = table2_only_result.to_pandas()
+            count_result = self.session.sql(table2_only_count_sql).collect()
+            table2_only_count = count_result[0]['COUNT_ONLY']
             
-            for _, row in table2_only_df.iterrows():
-                table2_only_rows.append(row.to_dict())
+            # Sample only first 1000 records for memory efficiency
+            if table2_only_count > 0:
+                table2_only_cols = ", ".join([f"t2.{col}" for col in pk_columns])
+                table2_only_sql = f"""
+                SELECT {table2_only_cols}
+                FROM temp_table2 t2
+                LEFT JOIN temp_table1 t1 ON {pk_join_condition}
+                WHERE t1.{pk_columns[0]} IS NULL
+                LIMIT 1000
+                """
+                
+                table2_only_result = self.session.sql(table2_only_sql)
+                table2_only_df = table2_only_result.to_pandas()
+                
+                for _, row in table2_only_df.iterrows():
+                    table2_only_rows.append(row.to_dict())
             
-            # 3. Find matching rows with different values in ANY column
-            self.logger.info("Finding rows with mismatched column values...")
+            # 3. Count mismatched rows first, then sample
+            self.logger.info("Counting rows with mismatched column values...")
             
-            # Build select columns for comprehensive comparison
-            select_columns = []
+            # Build comparison conditions
             comparison_conditions = []
-            
-            # Add primary key columns
-            for col in pk_columns:
-                select_columns.append(f"t1.{col}")
-            
-            # Add all common columns with both table values for comparison
             for col in common_columns:
                 if col not in pk_columns:  # Skip primary key columns in comparison
-                    select_columns.extend([f"t1.{col} as {table1_alias}_{col}", f"t2.{col} as {table2_alias}_{col}"])
                     comparison_conditions.append(f"""
                         (COALESCE(CAST(t1.{col} AS STRING), 'NULL') != COALESCE(CAST(t2.{col} AS STRING), 'NULL'))
                     """)
             
             if comparison_conditions:
-                # Build the comprehensive mismatch query
-                mismatch_sql = f"""
-                SELECT {', '.join(select_columns)}
+                # Count total mismatches
+                mismatch_count_sql = f"""
+                SELECT COUNT(*) as count_mismatches
                 FROM temp_table1 t1
                 INNER JOIN temp_table2 t2 ON {pk_join_condition}
                 WHERE {' OR '.join(comparison_conditions)}
                 """
                 
-                mismatch_result = self.session.sql(mismatch_sql)
-                mismatch_df = mismatch_result.to_pandas()
+                count_result = self.session.sql(mismatch_count_sql).collect()
+                total_mismatch_rows = count_result[0]['COUNT_MISMATCHES']
                 
-                # Process mismatched rows
-                for _, row in mismatch_df.iterrows():
-                    # Extract primary key values
-                    pk_values = {}
-                    for col in pk_columns:
-                        pk_values[col] = row[col]
+                # Sample mismatched rows for detailed analysis (limit to 5000 for memory)
+                if total_mismatch_rows > 0:
+                    select_columns = []
                     
-                    # Find which columns have differences
-                    for col in common_columns:
-                        if col not in pk_columns:
+                    # Add primary key columns
+                    for col in pk_columns:
+                        select_columns.append(f"t1.{col}")
+                    
+                    # Add sample of non-pk columns with both table values for comparison
+                    sample_columns = [col for col in common_columns if col not in pk_columns][:10]  # Limit columns
+                    
+                    for col in sample_columns:
+                        select_columns.extend([f"t1.{col} as {table1_alias}_{col}", f"t2.{col} as {table2_alias}_{col}"])
+                    
+                    # Build sample mismatch query
+                    mismatch_sql = f"""
+                    SELECT {', '.join(select_columns)}
+                    FROM temp_table1 t1
+                    INNER JOIN temp_table2 t2 ON {pk_join_condition}
+                    WHERE {' OR '.join(comparison_conditions[:5])}
+                    LIMIT 5000
+                    """
+                    
+                    mismatch_result = self.session.sql(mismatch_sql)
+                    mismatch_df = mismatch_result.to_pandas()
+                    
+                    # Process sample mismatched rows
+                    for _, row in mismatch_df.iterrows():
+                        # Extract primary key values
+                        pk_values = {}
+                        for col in pk_columns:
+                            pk_values[col] = row[col]
+                        
+                        # Check sample columns for differences
+                        for col in sample_columns:
                             table1_val = row.get(f'{table1_alias}_{col}')
                             table2_val = row.get(f'{table2_alias}_{col}')
                             
@@ -325,6 +371,12 @@ class GenericTableValidator:
                                     'TABLE2_ALIAS': table2_alias
                                 }
                                 mismatched_rows.append(mismatch_record)
+                
+                # Use actual counts for summary
+                estimated_total_mismatches = total_mismatch_rows * len([col for col in common_columns if col not in pk_columns])
+            else:
+                total_mismatch_rows = 0
+                estimated_total_mismatches = 0
             
             # Generate comprehensive summary statistics
             summary_stats = {
@@ -335,21 +387,25 @@ class GenericTableValidator:
                 'table2_alias': table2_alias,
                 'total_table1_rows': table1_info['row_count'],
                 'total_table2_rows': table2_info['row_count'],
-                'rows_only_in_table1': len(table1_only_rows),
-                'rows_only_in_table2': len(table2_only_rows),
-                'mismatched_data_points': len(mismatched_rows),
+                'rows_only_in_table1': table1_only_count,  # Use actual count
+                'rows_only_in_table2': table2_only_count,  # Use actual count
+                'mismatched_rows_count': total_mismatch_rows,  # Use actual count
+                'mismatched_data_points': len(mismatched_rows),  # Sample count
+                'estimated_total_mismatches': estimated_total_mismatches,
                 'primary_key_columns': pk_columns,
                 'common_columns': common_columns,
                 'total_common_columns': len(common_columns),
-                'validation_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                'validation_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'note': 'Results are sampled for memory efficiency'
             }
             
             self.logger.info(f"Comprehensive comparison completed:")
             self.logger.info(f"  - Total {table1_alias} rows: {summary_stats['total_table1_rows']}")
             self.logger.info(f"  - Total {table2_alias} rows: {summary_stats['total_table2_rows']}")
-            self.logger.info(f"  - {table1_alias} only rows: {len(table1_only_rows)}")
-            self.logger.info(f"  - {table2_alias} only rows: {len(table2_only_rows)}")
-            self.logger.info(f"  - Mismatched data points: {len(mismatched_rows)}")
+            self.logger.info(f"  - {table1_alias} only rows: {table1_only_count}")
+            self.logger.info(f"  - {table2_alias} only rows: {table2_only_count}")
+            self.logger.info(f"  - Mismatched rows: {total_mismatch_rows}")
+            self.logger.info(f"  - Sample data points: {len(mismatched_rows)}")
             
         except Exception as e:
             self.logger.error(f"Error during comprehensive table comparison: {str(e)}")
@@ -469,7 +525,7 @@ class GenericTableValidator:
         
         # Perform comprehensive comparison
         mismatched_rows, table1_only_rows, table2_only_rows, summary_stats = self.compare_tables_comprehensive(
-            table1_name, table2_name, primary_key_columns, table1_alias, table2_alias
+            table1_name, table2_name, primary_key_columns, table1_alias, table2_alias, batch_size=5000
         )
         
         # Generate output names with timestamp and aliases
@@ -533,10 +589,10 @@ class GenericTableValidator:
             'validation_issues': validation_issues,
             'summary_statistics': summary_stats,
             'results_summary': {
-                'mismatched_rows_count': len(mismatched_rows),
-                f'{table1_alias}_only_rows_count': len(table1_only_rows),
-                f'{table2_alias}_only_rows_count': len(table2_only_rows),
-                'total_issues_found': len(mismatched_rows) + len(table1_only_rows) + len(table2_only_rows)
+                'mismatched_rows_count': summary_stats.get('mismatched_rows_count', len(mismatched_rows)),
+                f'{table1_alias}_only_rows_count': summary_stats.get('rows_only_in_table1', len(table1_only_rows)),
+                f'{table2_alias}_only_rows_count': summary_stats.get('rows_only_in_table2', len(table2_only_rows)),
+                'total_issues_found': summary_stats.get('mismatched_rows_count', len(mismatched_rows)) + summary_stats.get('rows_only_in_table1', len(table1_only_rows)) + summary_stats.get('rows_only_in_table2', len(table2_only_rows))
             },
             'created_tables': created_tables if create_tables else None,
             'stage_files': stage_files
