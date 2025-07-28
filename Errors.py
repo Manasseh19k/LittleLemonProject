@@ -1,5 +1,1 @@
-100357 (P0000): Python Interpreter Error:
-  Worksheet, line 571
-    (summary[f'{stats['table1_alias']}_only_rows_count'])
-                       ^^^^^^^^^^^^
-SyntaxError: f-string: f-string: unmatched '[
+Function available memory exhausted. Please visit https://docs.snowflake.com/en/developer-guide/stored-procedure/python/procedure-python-profiler for help identifying bottlenecks.
