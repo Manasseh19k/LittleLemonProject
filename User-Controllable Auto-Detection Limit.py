@@ -1,5 +1,5 @@
 # Create validator
-        validator = GenericTableValidator(session)# The Snowpark package is required for Python Worksheets. 
+        # validator = GenericTableValidator(session)# The Snowpark package is required for Python Worksheets. 
 # You can add more packages by selecting them using the Packages control and then importing them.
 
 import snowflake.snowpark as snowpark
@@ -1097,7 +1097,7 @@ def main():
                 environment='SNOWFLAKE',
                 create_tables=False,
                 stage_name='@~/',
-                max_sample_size=None,     # None=auto-decide, False=unlimited, int=specific limit
+                max_sample_size=False,     # None=auto-decide, False=unlimited, int=specific limit
                 max_auto_columns=None     # None=default(50), int=user-specified limit
             )
             
