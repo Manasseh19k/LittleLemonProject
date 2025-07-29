@@ -1,4 +1,5 @@
-# The Snowpark package is required for Python Worksheets. 
+# Create validator
+        validator = GenericTableValidator(session)# The Snowpark package is required for Python Worksheets. 
 # You can add more packages by selecting them using the Packages control and then importing them.
 
 import snowflake.snowpark as snowpark
@@ -302,12 +303,13 @@ class GenericTableValidator:
                                        comparison_columns: List[str],
                                        table1_alias: str = "SQL", 
                                        table2_alias: str = "MDP",
-                                       max_sample_size: int = 1000,
+                                       max_sample_size = 1000,
                                        user_specified_columns: bool = False) -> Tuple[List[Dict], List[Dict], List[Dict], Dict]:
         """
-        Memory-optimized comparison that only processes specified columns and limits sample sizes
+        Memory-optimized comparison that processes specified columns with smart sampling
         
         Args:
+            max_sample_size: int for auto-columns, False for unlimited when user specifies columns
             user_specified_columns: True if user explicitly specified comparison columns
         
         Returns:
@@ -318,16 +320,30 @@ class GenericTableValidator:
         table2_only_rows = []
         summary_stats = {}
         
-        # Calculate effective sample size and batch strategy
+        # Calculate effective sample size and batch strategy based on user input
         if user_specified_columns:
-            # User specified columns - less memory risk, can be more generous with samples
-            effective_sample_size = max_sample_size
-            columns_per_batch = min(len(comparison_columns), 10)  # Process more columns at once
-            self.logger.info(f"User-specified columns mode: processing {len(comparison_columns)} columns with {effective_sample_size} max samples")
+            if max_sample_size is False:
+                # User specified columns and wants unlimited samples
+                effective_sample_size = None  # No limit
+                columns_per_batch = min(len(comparison_columns), 15)  # Can process more columns
+                sampling_note = "unlimited (user-specified columns)"
+                self.logger.info(f"User-specified columns mode: processing {len(comparison_columns)} columns with unlimited samples")
+            else:
+                # User specified columns but also set a sample limit
+                effective_sample_size = max_sample_size
+                columns_per_batch = min(len(comparison_columns), 10)
+                sampling_note = f"limited to {max_sample_size} (user-override)"
+                self.logger.info(f"User-specified columns mode: processing {len(comparison_columns)} columns with {effective_sample_size} max samples (user-override)")
         else:
-            # Auto-detected columns - more conservative with memory
-            effective_sample_size = min(max_sample_size, 1000)  # Cap at 1000 for safety
+            # Auto-detected columns - always use conservative sampling
+            if max_sample_size is False:
+                effective_sample_size = 2000  # Default for auto-detected when False specified
+                self.logger.warning("max_sample_size=False with auto-detected columns - using conservative limit of 2000")
+            else:
+                effective_sample_size = min(max_sample_size, 2000)  # Cap for safety
+            
             columns_per_batch = min(len(comparison_columns), 5)  # Process fewer columns at once
+            sampling_note = f"limited to {effective_sample_size} (auto-conservative)"
             self.logger.info(f"Auto-detected columns mode: processing {len(comparison_columns)} columns with {effective_sample_size} max samples (memory-conservative)")
         
         try:
@@ -361,7 +377,7 @@ class GenericTableValidator:
             table1_only_count = count_result[0]['COUNT_ONLY']
             
             if table1_only_count > 0:
-                # Select only primary key columns + first few comparison columns to save memory
+                # Select columns based on user specification and sampling strategy
                 if user_specified_columns:
                     sample_cols = primary_key_columns + comparison_columns  # Use all user-specified columns
                 else:
@@ -369,12 +385,15 @@ class GenericTableValidator:
                 
                 select_cols = ", ".join([f"t1.{col}" for col in sample_cols])
                 
+                # Apply limit only if effective_sample_size is not None
+                limit_clause = f"LIMIT {effective_sample_size}" if effective_sample_size is not None else ""
+                
                 table1_only_sql = f"""
                 SELECT {select_cols}
                 FROM temp_table1 t1
                 LEFT JOIN temp_table2 t2 ON {pk_join_condition}
                 WHERE t2.{primary_key_columns[0]} IS NULL
-                LIMIT {effective_sample_size}
+                {limit_clause}
                 """
                 table1_only_result = self.session.sql(table1_only_sql)
                 table1_only_df = table1_only_result.to_pandas()
@@ -399,7 +418,7 @@ class GenericTableValidator:
             table2_only_count = count_result[0]['COUNT_ONLY']
             
             if table2_only_count > 0:
-                # Select only primary key columns + first few comparison columns to save memory
+                # Select columns based on user specification and sampling strategy
                 if user_specified_columns:
                     sample_cols = primary_key_columns + comparison_columns  # Use all user-specified columns
                 else:
@@ -407,12 +426,15 @@ class GenericTableValidator:
                 
                 select_cols = ", ".join([f"t2.{col}" for col in sample_cols])
                 
+                # Apply limit only if effective_sample_size is not None
+                limit_clause = f"LIMIT {effective_sample_size}" if effective_sample_size is not None else ""
+                
                 table2_only_sql = f"""
                 SELECT {select_cols}
                 FROM temp_table2 t2
                 LEFT JOIN temp_table1 t1 ON {pk_join_condition}
                 WHERE t1.{primary_key_columns[0]} IS NULL
-                LIMIT {effective_sample_size}
+                {limit_clause}
                 """
                 table2_only_result = self.session.sql(table2_only_sql)
                 table2_only_df = table2_only_result.to_pandas()
@@ -447,10 +469,16 @@ class GenericTableValidator:
                 total_mismatch_rows = count_result[0]['COUNT_MISMATCHES']
                 
                 if total_mismatch_rows > 0:
-                    # Process mismatches in smaller batches
-                    batch_size = min(effective_sample_size, 1000)  # Use effective sample size
+                    # Set batch processing limits based on sampling strategy
+                    if effective_sample_size is not None:
+                        batch_size = min(effective_sample_size, 1000)
+                        max_columns_to_process = min(len(comparison_columns), 20)
+                    else:
+                        # Unlimited sampling - can process more data
+                        batch_size = 5000  # Larger batches when unlimited
+                        max_columns_to_process = len(comparison_columns)  # Process all columns
                     
-                    for batch_start in range(0, min(len(comparison_columns), 20), columns_per_batch):  # Process more columns if user-specified
+                    for batch_start in range(0, max_columns_to_process, columns_per_batch):
                         batch_columns = comparison_columns[batch_start:batch_start + columns_per_batch]
                         
                         # Build select columns for this batch
@@ -464,12 +492,15 @@ class GenericTableValidator:
                             batch_conditions.append(f"(COALESCE(CAST(t1.{col} AS STRING), 'NULL') != COALESCE(CAST(t2.{col} AS STRING), 'NULL'))")
                         
                         if batch_conditions:
+                            # Apply limit only if we have a sample size limit
+                            limit_clause = f"LIMIT {batch_size}" if effective_sample_size is not None else ""
+                            
                             mismatch_sql = f"""
                             SELECT {', '.join(select_columns)}
                             FROM temp_table1 t1
                             INNER JOIN temp_table2 t2 ON {pk_join_condition}
                             WHERE {' OR '.join(batch_conditions)}
-                            LIMIT {batch_size}
+                            {limit_clause}
                             """
                             
                             mismatch_result = self.session.sql(mismatch_sql)
@@ -497,12 +528,12 @@ class GenericTableValidator:
                                         }
                                         mismatched_rows.append(mismatch_record)
                                         
-                                        # Limit total mismatched rows to prevent memory issues
-                                        if len(mismatched_rows) >= effective_sample_size:
+                                        # Only limit if we have a sample size limit
+                                        if effective_sample_size is not None and len(mismatched_rows) >= effective_sample_size:
                                             break
                             
-                            # Break if we've reached the sample limit
-                            if len(mismatched_rows) >= effective_sample_size:
+                            # Break if we've reached the sample limit (only when limited)
+                            if effective_sample_size is not None and len(mismatched_rows) >= effective_sample_size:
                                 break
                 
                 estimated_total_mismatches = total_mismatch_rows * len(comparison_columns)
@@ -526,11 +557,11 @@ class GenericTableValidator:
                 'primary_key_columns': primary_key_columns,
                 'comparison_columns': comparison_columns,
                 'total_comparison_columns': len(comparison_columns),
-                'max_sample_size': effective_sample_size,
+                'max_sample_size': effective_sample_size if effective_sample_size is not None else "unlimited",
                 'user_specified_columns': user_specified_columns,
                 'memory_strategy': 'user-optimized' if user_specified_columns else 'auto-conservative',
                 'validation_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                'note': f'Results are sampled (max {effective_sample_size} per category) using {summary_stats.get("memory_strategy", "default")} strategy'
+                'note': f'Results are {sampling_note}'
             }
             
             self.logger.info(f"Memory-optimized comparison completed:")
@@ -554,10 +585,10 @@ class GenericTableValidator:
                        environment: str = "SNOWFLAKE",
                        create_tables: bool = True,
                        stage_name: str = "@~/",
-                       max_sample_size: int = 1000,
-                       max_auto_columns: int = 50) -> Dict[str, Any]:
+                       max_sample_size = None,
+                       max_auto_columns: int = None) -> Dict[str, Any]:
         """
-        Enhanced table validation with memory optimization and column selection
+        Enhanced table validation with smart sampling based on column specification
         
         Args:
             table1_name: Name of first table
@@ -569,12 +600,27 @@ class GenericTableValidator:
             environment: Environment name
             create_tables: Whether to create result tables
             stage_name: Snowflake stage for output files
-            max_sample_size: Maximum number of sample rows per category (less critical when comparison_columns specified)
-            max_auto_columns: Maximum columns to auto-select when comparison_columns is None (user-controllable)
+            max_sample_size: None=auto-decide, int=specific limit, False=unlimited (user-controllable)
+            max_auto_columns: None=default(50), int=user-specified limit for auto-detection
             
         Returns:
             Dictionary with validation results
         """
+        # Smart defaults based on user input
+        if max_sample_size is None:
+            # Auto-decide based on whether user specified columns
+            if comparison_columns:
+                final_max_sample_size = False  # Unlimited when user specifies columns
+            else:
+                final_max_sample_size = 1000   # Conservative default for auto-detection
+        else:
+            # User explicitly set it
+            final_max_sample_size = max_sample_size
+        
+        if max_auto_columns is None:
+            final_max_auto_columns = 50  # Default
+        else:
+            final_max_auto_columns = max_auto_columns
         self.logger.info("="*80)
         self.logger.info("STARTING MEMORY-OPTIMIZED TABLE VALIDATION")
         self.logger.info("="*80)
@@ -582,8 +628,8 @@ class GenericTableValidator:
         self.logger.info(f"Table 2 ({table2_alias}): {table2_name}")
         self.logger.info(f"Environment: {environment}")
         self.logger.info(f"Primary Key Columns: {primary_key_columns}")
-        self.logger.info(f"Comparison Columns: {comparison_columns if comparison_columns else f'Auto-detect (max {max_auto_columns})'}")
-        self.logger.info(f"Max Sample Size: {max_sample_size}")
+        self.logger.info(f"Comparison Columns: {comparison_columns if comparison_columns else f'Auto-detect (max {final_max_auto_columns})'}")
+        self.logger.info(f"Max Sample Size: {'Auto-decided' if max_sample_size is None else ('False (unlimited)' if final_max_sample_size is False else final_max_sample_size)}")
         self.logger.info(f"Timestamp: {self.timestamp}")
         
         # Determine if user specified columns
@@ -614,14 +660,14 @@ class GenericTableValidator:
             return None
         
         # Identify comparison columns
-        comp_columns = self.identify_comparison_columns(table1_info, table2_info, pk_columns, comparison_columns, max_auto_columns)
+        comp_columns = self.identify_comparison_columns(table1_info, table2_info, pk_columns, comparison_columns, final_max_auto_columns)
         if not comp_columns:
             self.logger.error("No valid comparison columns identified")
             return None
         
         # Run memory-optimized comparison
         mismatched_rows, table1_only_rows, table2_only_rows, summary_stats = self.compare_tables_memory_optimized(
-            table1_name, table2_name, pk_columns, comp_columns, table1_alias, table2_alias, max_sample_size, user_specified_columns
+            table1_name, table2_name, pk_columns, comp_columns, table1_alias, table2_alias, final_max_sample_size, user_specified_columns
         )
         
         # Generate output file names
@@ -912,7 +958,7 @@ class GenericTableValidator:
             print("2. Specify columns: Use comparison_columns=['COL1', 'COL2'] for better memory control")
             print("3. Adjust auto-limit: Use max_auto_columns=100 to process more columns automatically")
         
-        print(f"4. Memory control: Current max_sample_size={stats['max_sample_size']} (less critical with specific columns)")
+        print(f"4. Memory control: Current max_sample_size={stats['max_sample_size']} ({'unlimited when columns specified' if stats.get('user_specified_columns') else 'adjust as needed'})")
         print("5. This will show actual mismatches with details for manual verification")
 
 
@@ -926,24 +972,24 @@ def validate_tables_sp(session: Session,
                       environment: str = "SNOWFLAKE",
                       create_tables: bool = True,
                       stage_name: str = "@~/",
-                      max_sample_size: int = 1000,
-                      max_auto_columns: int = 50) -> str:
+                      max_sample_size = None,
+                      max_auto_columns: int = None) -> str:
     """
-    Stored procedure version of memory-optimized table validation
+    Stored procedure version with smart sampling logic
     
     Args:
         session: Snowpark session
         table1_name: Fully qualified name of first table
         table2_name: Fully qualified name of second table
         primary_key_columns: Comma-separated list of primary key column names
-        comparison_columns: Comma-separated list of columns to compare (optional - when specified, max_sample_size becomes less critical)
+        comparison_columns: Comma-separated list of columns to compare (when provided, defaults max_sample_size to False)
         table1_alias: Alias for first table (default: SQL for dev)
         table2_alias: Alias for second table (default: MDP for prod)
         environment: Database environment
         create_tables: Whether to create result tables
         stage_name: Snowflake stage for output files
-        max_sample_size: Maximum sample size for memory management (less important when comparison_columns specified)
-        max_auto_columns: Maximum columns to auto-select when comparison_columns is None (user-controllable)
+        max_sample_size: None=auto-decide, int=specific limit, False=unlimited (user-controllable)
+        max_auto_columns: None=default(50), int=user-specified limit for auto-detection
     
     Returns:
         Validation results summary as string
@@ -959,8 +1005,21 @@ def validate_tables_sp(session: Session,
         if comparison_columns:
             comp_columns = [col.strip().upper() for col in comparison_columns.split(',')]
         
-        # Create validator
-        validator = GenericTableValidator(session)
+        # Smart defaults based on user input
+        if max_sample_size is None:
+            # Auto-decide based on whether user specified columns
+            if comp_columns:
+                final_max_sample_size = False  # Unlimited when user specifies columns
+            else:
+                final_max_sample_size = 1000   # Conservative default for auto-detection
+        else:
+            # User explicitly set it
+            final_max_sample_size = max_sample_size
+        
+        if max_auto_columns is None:
+            final_max_auto_columns = 50  # Default
+        else:
+            final_max_auto_columns = max_auto_columns
         
         # Run memory-optimized validation
         results = validator.validate_tables(
@@ -973,8 +1032,8 @@ def validate_tables_sp(session: Session,
             environment=environment,
             create_tables=create_tables,
             stage_name=stage_name,
-            max_sample_size=max_sample_size,
-            max_auto_columns=max_auto_columns
+            max_sample_size=final_max_sample_size,
+            max_auto_columns=final_max_auto_columns
         )
         
         if results:
@@ -988,14 +1047,14 @@ def validate_tables_sp(session: Session,
                     Environment: {results['environment']}
                     {table1_alias} ({stats['table1_name']}): {stats['total_table1_rows']:,} rows
                     {table2_alias} ({stats['table2_name']}): {stats['total_table2_rows']:,} rows
-                    Mismatches: {summary['mismatched_rows_count']:,} (sampled)
+                    Mismatches: {summary['mismatched_rows_count']:,}
                     {table1_alias} Only: {summary[f'{table1_alias}_only_rows_count']:,}
                     {table2_alias} Only: {summary[f'{table2_alias}_only_rows_count']:,}
                     Total Issues: {summary['total_issues_found']:,}
                     Primary Keys: {', '.join(stats['primary_key_columns'])}
                     Comparison Columns: {stats['total_comparison_columns']}
                     Memory Strategy: {stats.get('memory_strategy', 'default')}
-                    Max Sample Size: {stats['max_sample_size']:,}
+                    Sample Size: {stats['max_sample_size']}
                                 """.strip()
         else:
             return "Table validation failed to complete"
@@ -1038,8 +1097,8 @@ def main():
                 environment='SNOWFLAKE',
                 create_tables=False,
                 stage_name='@~/',
-                max_sample_size=1000,  # Less critical when comparison_columns specified
-                max_auto_columns=50    # User controls auto-detection limit
+                max_sample_size=None,     # None=auto-decide, False=unlimited, int=specific limit
+                max_auto_columns=None     # None=default(50), int=user-specified limit
             )
             
             if results:
