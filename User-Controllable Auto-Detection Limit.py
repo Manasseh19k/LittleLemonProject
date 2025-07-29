@@ -1097,8 +1097,8 @@ def main():
                 environment='SNOWFLAKE',
                 create_tables=False,
                 stage_name='@~/',
-                max_sample_size=False,     # None=auto-decide, False=unlimited, int=specific limit
-                max_auto_columns=None     # None=default(50), int=user-specified limit
+                max_sample_size=56000,     # None=auto-decide, False=unlimited, int=specific limit
+                max_auto_columns=77     # None=default(50), int=user-specified limit
             )
             
             if results:
