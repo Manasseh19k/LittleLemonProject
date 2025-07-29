@@ -1,6 +1,5 @@
 # Create validator
-        # validator = GenericTableValidator(session)# The Snowpark package is required for Python Worksheets. 
-# You can add more packages by selecting them using the Packages control and then importing them.
+        validator = GenericTableValidator(session)
 
 import snowflake.snowpark as snowpark
 import pandas as pd
@@ -340,7 +339,8 @@ class GenericTableValidator:
                 effective_sample_size = 2000  # Default for auto-detected when False specified
                 self.logger.warning("max_sample_size=False with auto-detected columns - using conservative limit of 2000")
             else:
-                effective_sample_size = min(max_sample_size, 2000)  # Cap for safety
+                # FIXED: Don't cap user's explicit sample size - let them control it
+                effective_sample_size = max_sample_size  # Use user's value directly
             
             columns_per_batch = min(len(comparison_columns), 5)  # Process fewer columns at once
             sampling_note = f"limited to {effective_sample_size} (auto-conservative)"
@@ -1021,6 +1021,9 @@ def validate_tables_sp(session: Session,
         else:
             final_max_auto_columns = max_auto_columns
         
+        # Create validator
+        validator = GenericTableValidator(session)
+        
         # Run memory-optimized validation
         results = validator.validate_tables(
             table1_name=table1_name,
@@ -1097,8 +1100,8 @@ def main():
                 environment='SNOWFLAKE',
                 create_tables=False,
                 stage_name='@~/',
-                max_sample_size=56000,     # None=auto-decide, False=unlimited, int=specific limit
-                max_auto_columns=77     # None=default(50), int=user-specified limit
+                max_sample_size=None,     # None=auto-decide, False=unlimited, int=specific limit
+                max_auto_columns=None     # None=default(50), int=user-specified limit
             )
             
             if results:
