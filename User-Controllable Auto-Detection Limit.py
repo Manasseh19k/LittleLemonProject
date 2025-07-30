@@ -1,6 +1,3 @@
-# Create validator
-        validator = GenericTableValidator(session)
-
 import snowflake.snowpark as snowpark
 import pandas as pd
 from snowflake.snowpark import Session
@@ -339,7 +336,7 @@ class GenericTableValidator:
                 effective_sample_size = 2000  # Default for auto-detected when False specified
                 self.logger.warning("max_sample_size=False with auto-detected columns - using conservative limit of 2000")
             else:
-                # FIXED: Don't cap user's explicit sample size - let them control it
+                # User control sample size
                 effective_sample_size = max_sample_size  # Use user's value directly
             
             columns_per_batch = min(len(comparison_columns), 5)  # Process fewer columns at once
@@ -1100,8 +1097,8 @@ def main():
                 environment='SNOWFLAKE',
                 create_tables=False,
                 stage_name='@~/',
-                max_sample_size=None,     # None=auto-decide, False=unlimited, int=specific limit
-                max_auto_columns=None     # None=default(50), int=user-specified limit
+                max_sample_size=20851357,     # None=auto-decide, False=unlimited, int=specific limit. To help with memory management
+                max_auto_columns=77     # None=default(50), int=user-specified limit. To help with memory management
             )
             
             if results:
