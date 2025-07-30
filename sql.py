@@ -10,10 +10,10 @@ from datetime import datetime
 import logging
 from typing import Dict, List, Tuple, Any, Optional
 
-class StreamingTableValidator:
+class GenericTableValidator:
     def __init__(self, session: Session = None):
         """
-        Initialize the Streaming Table Validator with memory-efficient processing
+        Initialize the Generic Table Validator with streaming capabilities
         
         Args:
             session: Snowflake Snowpark session (if None, will use current session context)
@@ -129,6 +129,16 @@ class StreamingTableValidator:
                                   max_auto_columns: int = 50) -> List[str]:
         """
         Identify columns to use for comparison
+        
+        Args:
+            table1_info: Information about table 1
+            table2_info: Information about table 2
+            primary_key_columns: List of primary key columns (to exclude from comparison)
+            comparison_columns: Optional list of specific columns to compare
+            max_auto_columns: Maximum number of columns to auto-select (only used when comparison_columns is None)
+            
+        Returns:
+            List of column names to compare
         """
         table1_cols = [col.upper() for col in table1_info['column_names']]
         table2_cols = [col.upper() for col in table2_info['column_names']]
@@ -156,6 +166,7 @@ class StreamingTableValidator:
         
         # Auto-select columns based on user-defined limit
         if len(available_comparison_cols) > max_auto_columns:
+            # If too many columns, limit based on user preference
             selected_cols = list(available_comparison_cols)[:max_auto_columns]
             self.logger.info(f"Found {len(available_comparison_cols)} comparison columns. Auto-selected first {max_auto_columns} columns: {selected_cols}")
         else:
@@ -163,242 +174,434 @@ class StreamingTableValidator:
             self.logger.info(f"Using all available comparison columns ({len(selected_cols)} columns): {selected_cols}")
         
         return selected_cols
-
-    def create_result_tables_directly(self, table1_name: str, table2_name: str,
-                                    primary_key_columns: List[str],
-                                    comparison_columns: List[str],
-                                    table1_alias: str = "SQL", 
-                                    table2_alias: str = "MDP") -> Dict[str, Any]:
+    
+    def _normalize_data_for_csv(self, data: List[Dict]) -> List[Dict]:
         """
-        Create result tables directly in Snowflake using SQL without loading data into memory
-        This is the most memory-efficient approach for getting ALL records
+        Normalize data to handle mixed data types and empty strings for CSV export
         """
-        results = {}
+        if not data:
+            return data
         
+        normalized_data = []
+        for row in data:
+            normalized_row = {}
+            for key, value in row.items():
+                # Convert all values to strings and handle None/NaN
+                if pd.isna(value) or value is None:
+                    normalized_row[key] = ""  # Empty string instead of None
+                elif isinstance(value, (int, float)):
+                    normalized_row[key] = str(value)
+                elif isinstance(value, str):
+                    # Handle empty strings - keep them as empty strings
+                    normalized_row[key] = value if value else ""
+                else:
+                    # Convert other types to string
+                    normalized_row[key] = str(value)
+            normalized_data.append(normalized_row)
+        
+        return normalized_data
+    
+    def _print_first_n_rows(self, data: List[Dict], n: int = 10, title: str = ""):
+        if not data:
+            print(f"\n{title} - No data available.")
+            return
+        print(f"\n{title} - Printing up to {n} sample rows:")
+        for i, row in enumerate(data[:n]):
+            print(f"Row {i+1}: {row}")
+        if len(data) > n:
+            print(f"... ({len(data)-n} more rows not shown)")
+
+    def create_snowflake_table(self, table_name: str, data: List[Dict]):
+        """
+        Create Snowflake table with validation results and print sample rows
+        """
+        if not data:
+            self.logger.info(f"No data to create table {table_name}")
+            print(f"\nTable {table_name} - No data to write.")
+            return
         try:
+            self._print_first_n_rows(data, 10, f"Table {table_name}")
+            
+            # Normalize data for consistent data types
+            normalized_data = self._normalize_data_for_csv(data)
+            df = pd.DataFrame(normalized_data)
+            
+            # Clean column names
+            df.columns = [col.replace('(', '').replace(')', '').replace(' ', '_').replace('-', '_') for col in df.columns]
+            
+            snowpark_df = self.session.create_dataframe(df)
+            snowpark_df.write.mode("overwrite").save_as_table(table_name)
+            self.logger.info(f"Created Snowflake table: {table_name} with {len(data)} rows")
+        except Exception as e:
+            self.logger.error(f"Error creating Snowflake table {table_name}: {str(e)}")
+            print(f"Error creating Snowflake table {table_name}: {str(e)}")
+    
+    def write_to_snowflake_stage(self, data: List[Dict], filename: str, stage_name: str = "@~/"):
+        """
+        Write data to Snowflake stage as CSV with proper file format options
+        """
+        if not data:
+            self.logger.info(f"No data to write to stage {filename}")
+            print(f"\nStage file {filename} - No data to write.")
+            return
+        try:
+            self._print_first_n_rows(data, 10, f"Stage file {filename}")
+            
+            # Normalize data to handle mixed data types and empty strings
+            normalized_data = self._normalize_data_for_csv(data)
+            df = pd.DataFrame(normalized_data)
+            
+            # Create Snowpark DataFrame
+            snowpark_df = self.session.create_dataframe(df)
+            
+            # Create a file format that can handle empty strings
+            format_name = f"CSV_FORMAT_{self.timestamp}"
+            try:
+                # Drop format if it exists
+                self.session.sql(f"DROP FILE FORMAT IF EXISTS {format_name}").collect()
+                
+                # Create file format with proper options for empty strings
+                self.session.sql(f"""
+                    CREATE FILE FORMAT {format_name}
+                    TYPE = 'CSV'
+                    FIELD_DELIMITER = ','
+                    RECORD_DELIMITER = '\\n'
+                    SKIP_HEADER = 1
+                    FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+                    NULL_IF = ('NULL', 'null')
+                    EMPTY_FIELD_AS_NULL = FALSE
+                    COMPRESSION = 'NONE'
+                """).collect()
+                
+                # Write to stage using the custom file format
+                self.session.sql(f"""
+                    COPY INTO {stage_name}{filename}
+                    FROM (SELECT * FROM ({snowpark_df.select("*").queries['queries'][0]}))
+                    FILE_FORMAT = (FORMAT_NAME = '{format_name}')
+                    OVERWRITE = TRUE
+                    HEADER = TRUE
+                """).collect()
+                
+                # Clean up the file format
+                self.session.sql(f"DROP FILE FORMAT IF EXISTS {format_name}").collect()
+                
+                self.logger.info(f"Created stage file: {stage_name}{filename}")
+                
+            except Exception as format_error:
+                self.logger.warning(f"Custom file format approach failed: {str(format_error)}")
+                # Fallback: try the original approach
+                snowpark_df.write.mode("overwrite").csv(f"{stage_name}{filename}")
+                self.logger.info(f"Created stage file using fallback method: {stage_name}{filename}")
+                
+        except Exception as e:
+            self.logger.error(f"Error writing to stage: {str(e)}")
+            print(f"Error writing to stage {filename}: {str(e)}")
+    
+    def compare_tables_memory_optimized(self, table1_name: str, table2_name: str,
+                                       primary_key_columns: List[str],
+                                       comparison_columns: List[str],
+                                       table1_alias: str = "SQL", 
+                                       table2_alias: str = "MDP",
+                                       max_sample_size = 1000,
+                                       user_specified_columns: bool = False) -> Tuple[List[Dict], List[Dict], List[Dict], Dict]:
+        """
+        Memory-optimized comparison using pure SQL - NO MEMORY LIMITS when streaming enabled
+        
+        Args:
+            max_sample_size: int for auto-columns, False for unlimited when user specifies columns  
+            user_specified_columns: True if user explicitly specified comparison columns
+        
+        Returns:
+            Tuple of (mismatched_rows, table1_only_rows, table2_only_rows, summary_stats)
+        """
+        mismatched_rows = []
+        table1_only_rows = []
+        table2_only_rows = []
+        summary_stats = {}
+        
+        # Calculate effective sample size and strategy based on user input
+        if user_specified_columns:
+            if max_sample_size is False:
+                # User specified columns and wants unlimited - USE STREAMING APPROACH
+                return self._compare_tables_streaming_all_records(
+                    table1_name, table2_name, primary_key_columns, comparison_columns, 
+                    table1_alias, table2_alias
+                )
+            else:
+                # User specified columns but also set a sample limit
+                effective_sample_size = max_sample_size
+                sampling_note = f"limited to {max_sample_size} (user-override)"
+                self.logger.info(f"User-specified columns mode: processing {len(comparison_columns)} columns with {effective_sample_size} max samples (user-override)")
+        else:
+            # Auto-detected columns - always use conservative sampling unless streaming requested
+            if max_sample_size is False:
+                self.logger.warning("max_sample_size=False with auto-detected columns - using streaming approach for ALL records")
+                return self._compare_tables_streaming_all_records(
+                    table1_name, table2_name, primary_key_columns, comparison_columns, 
+                    table1_alias, table2_alias
+                )
+            else:
+                effective_sample_size = max_sample_size
+                sampling_note = f"limited to {effective_sample_size} (auto-conservative)"
+                self.logger.info(f"Auto-detected columns mode: processing {len(comparison_columns)} columns with {effective_sample_size} max samples (memory-conservative)")
+        
+        # Continue with original sampling approach for limited cases
+        try:
+            table1_info = self.get_table_info(table1_name)
+            table2_info = self.get_table_info(table2_name)
+            if not table1_info or not table2_info:
+                self.logger.error("Failed to get table information")
+                return mismatched_rows, table1_only_rows, table2_only_rows, summary_stats
+
+            # Create temporary views
+            table1_df = self.session.table(table1_name)
+            table2_df = self.session.table(table2_name)
+            table1_df.create_or_replace_temp_view("temp_table1")
+            table2_df.create_or_replace_temp_view("temp_table2")
+            
             # Build primary key join condition
             pk_join_conditions = []
             for col in primary_key_columns:
                 pk_join_conditions.append(f"COALESCE(CAST(t1.{col} AS STRING), 'NULL') = COALESCE(CAST(t2.{col} AS STRING), 'NULL')")
             pk_join_condition = " AND ".join(pk_join_conditions)
             
-            # Generate table names
-            mismatch_table = f"TABLE_VALIDATION_MISMATCHES_{table1_alias}_VS_{table2_alias}_{self.timestamp}"
-            table1_only_table = f"TABLE_VALIDATION_{table1_alias}_ONLY_{self.timestamp}"
-            table2_only_table = f"TABLE_VALIDATION_{table2_alias}_ONLY_{self.timestamp}"
-            
-            # 1. Create table for rows only in TABLE1
-            self.logger.info(f"Creating table for {table1_alias}-only rows...")
-            table1_only_sql = f"""
-            CREATE OR REPLACE TABLE {table1_only_table} AS
-            SELECT t1.*
-            FROM {table1_name} t1
-            LEFT JOIN {table2_name} t2 ON {pk_join_condition}
+            # 1. Count and sample rows in TABLE1 but not in TABLE2
+            self.logger.info(f"Processing rows in {table1_alias} but not in {table2_alias}...")
+            table1_only_count_sql = f"""
+            SELECT COUNT(*) as count_only
+            FROM temp_table1 t1
+            LEFT JOIN temp_table2 t2 ON {pk_join_condition}
             WHERE t2.{primary_key_columns[0]} IS NULL
             """
-            self.session.sql(table1_only_sql).collect()
+            count_result = self.session.sql(table1_only_count_sql).collect()
+            table1_only_count = count_result[0]['COUNT_ONLY']
             
-            # Get count
-            count_result = self.session.sql(f"SELECT COUNT(*) as CNT FROM {table1_only_table}").collect()
-            table1_only_count = count_result[0]['CNT']
-            results['table1_only_count'] = table1_only_count
-            results['table1_only_table'] = table1_only_table
-            self.logger.info(f"Created {table1_only_table} with {table1_only_count:,} rows")
+            if table1_only_count > 0:
+                # Select columns based on user specification and sampling strategy
+                if user_specified_columns:
+                    sample_cols = primary_key_columns + comparison_columns  # Use all user-specified columns
+                else:
+                    sample_cols = primary_key_columns + comparison_columns[:5]  # Limit for auto-detected
+                
+                select_cols = ", ".join([f"t1.{col}" for col in sample_cols])
+                limit_clause = f"LIMIT {effective_sample_size}"
+                
+                table1_only_sql = f"""
+                SELECT {select_cols}
+                FROM temp_table1 t1
+                LEFT JOIN temp_table2 t2 ON {pk_join_condition}
+                WHERE t2.{primary_key_columns[0]} IS NULL
+                {limit_clause}
+                """
+                table1_only_result = self.session.sql(table1_only_sql)
+                table1_only_df = table1_only_result.to_pandas()
+                for _, row in table1_only_df.iterrows():
+                    row_dict = {}
+                    for key, value in row.to_dict().items():
+                        if pd.isna(value):
+                            row_dict[key] = None
+                        else:
+                            row_dict[key] = value
+                    table1_only_rows.append(row_dict)
             
-            # 2. Create table for rows only in TABLE2
-            self.logger.info(f"Creating table for {table2_alias}-only rows...")
-            table2_only_sql = f"""
-            CREATE OR REPLACE TABLE {table2_only_table} AS
-            SELECT t2.*
-            FROM {table2_name} t2
-            LEFT JOIN {table1_name} t1 ON {pk_join_condition}
+            # 2. Count and sample rows in TABLE2 but not in TABLE1
+            self.logger.info(f"Processing rows in {table2_alias} but not in {table1_alias}...")
+            table2_only_count_sql = f"""
+            SELECT COUNT(*) as count_only
+            FROM temp_table2 t2
+            LEFT JOIN temp_table1 t1 ON {pk_join_condition}
             WHERE t1.{primary_key_columns[0]} IS NULL
             """
-            self.session.sql(table2_only_sql).collect()
+            count_result = self.session.sql(table2_only_count_sql).collect()
+            table2_only_count = count_result[0]['COUNT_ONLY']
             
-            # Get count
-            count_result = self.session.sql(f"SELECT COUNT(*) as CNT FROM {table2_only_table}").collect()
-            table2_only_count = count_result[0]['CNT']
-            results['table2_only_count'] = table2_only_count
-            results['table2_only_table'] = table2_only_table
-            self.logger.info(f"Created {table2_only_table} with {table2_only_count:,} rows")
+            if table2_only_count > 0:
+                # Select columns based on user specification and sampling strategy
+                if user_specified_columns:
+                    sample_cols = primary_key_columns + comparison_columns  # Use all user-specified columns
+                else:
+                    sample_cols = primary_key_columns + comparison_columns[:5]  # Limit for auto-detected
+                
+                select_cols = ", ".join([f"t2.{col}" for col in sample_cols])
+                limit_clause = f"LIMIT {effective_sample_size}"
+                
+                table2_only_sql = f"""
+                SELECT {select_cols}
+                FROM temp_table2 t2
+                LEFT JOIN temp_table1 t1 ON {pk_join_condition}
+                WHERE t1.{primary_key_columns[0]} IS NULL
+                {limit_clause}
+                """
+                table2_only_result = self.session.sql(table2_only_sql)
+                table2_only_df = table2_only_result.to_pandas()
+                for _, row in table2_only_df.iterrows():
+                    row_dict = {}
+                    for key, value in row.to_dict().items():
+                        if pd.isna(value):
+                            row_dict[key] = None
+                        else:
+                            row_dict[key] = value
+                    table2_only_rows.append(row_dict)
             
-            # 3. Create mismatches table using UNPIVOT approach for ALL records
-            self.logger.info("Creating comprehensive mismatches table...")
+            # 3. Process mismatches using single-column approach
+            self.logger.info("Processing column mismatches...")
             
-            # Build comparison conditions for filtering
+            # Count total mismatches first
             comparison_conditions = []
             for col in comparison_columns:
                 comparison_conditions.append(f"""
                     (COALESCE(CAST(t1.{col} AS STRING), 'NULL') != COALESCE(CAST(t2.{col} AS STRING), 'NULL'))
                 """)
             
-            # Create the mismatches table with unpivoted structure
-            # This gives you one row per column mismatch, making it easier to analyze
-            pk_select = ", ".join([f"t1.{col}" for col in primary_key_columns])
+            if comparison_conditions:
+                mismatch_count_sql = f"""
+                SELECT COUNT(*) as count_mismatches
+                FROM temp_table1 t1
+                INNER JOIN temp_table2 t2 ON {pk_join_condition}
+                WHERE {' OR '.join(comparison_conditions)}
+                """
+                count_result = self.session.sql(mismatch_count_sql).collect()
+                total_mismatch_rows = count_result[0]['COUNT_MISMATCHES']
+                
+                if total_mismatch_rows > 0:
+                    # Process each column individually like original script
+                    for col in comparison_columns:
+                        single_col_sql = f"""
+                        SELECT t1.{', '.join(primary_key_columns)}, 
+                               t1.{col} as {table1_alias}_{col}, 
+                               t2.{col} as {table2_alias}_{col}
+                        FROM temp_table1 t1
+                        INNER JOIN temp_table2 t2 ON {pk_join_condition}
+                        WHERE COALESCE(CAST(t1.{col} AS STRING), 'NULL') != COALESCE(CAST(t2.{col} AS STRING), 'NULL')
+                        LIMIT {effective_sample_size}
+                        """
+                        
+                        single_result = self.session.sql(single_col_sql)
+                        single_df = single_result.to_pandas()
+                        
+                        # Process results for this single column
+                        for _, row in single_df.iterrows():
+                            pk_values = {}
+                            for pk_col in primary_key_columns:
+                                pk_values[pk_col] = row[pk_col]
+                            
+                            table1_val = row.get(f'{table1_alias}_{col}')
+                            table2_val = row.get(f'{table2_alias}_{col}')
+                            
+                            mismatch_record = {
+                                **pk_values,
+                                'COLUMN_NAME': col,
+                                f'{table1_alias}_VALUE': table1_val if pd.notna(table1_val) else None,
+                                f'{table2_alias}_VALUE': table2_val if pd.notna(table2_val) else None,
+                                'TABLE1_ALIAS': table1_alias,
+                                'TABLE2_ALIAS': table2_alias
+                            }
+                            mismatched_rows.append(mismatch_record)
+                            
+                            # Apply sample limit across all columns
+                            if len(mismatched_rows) >= effective_sample_size:
+                                break
+                        
+                        # Break if we've reached the sample limit
+                        if len(mismatched_rows) >= effective_sample_size:
+                            break
+                
+                estimated_total_mismatches = total_mismatch_rows * len(comparison_columns)
+            else:
+                total_mismatch_rows = 0
+                estimated_total_mismatches = 0
             
-            mismatch_cases = []
-            for col in comparison_columns:
-                mismatch_cases.append(f"""
-                SELECT {pk_select}, 
-                       '{col}' as COLUMN_NAME,
-                       COALESCE(CAST(t1.{col} AS STRING), 'NULL') as {table1_alias}_VALUE,
-                       COALESCE(CAST(t2.{col} AS STRING), 'NULL') as {table2_alias}_VALUE,
-                       '{table1_alias}' as TABLE1_ALIAS,
-                       '{table2_alias}' as TABLE2_ALIAS
-                FROM {table1_name} t1
-                INNER JOIN {table2_name} t2 ON {pk_join_condition}
-                WHERE COALESCE(CAST(t1.{col} AS STRING), 'NULL') != COALESCE(CAST(t2.{col} AS STRING), 'NULL')
-                """)
-            
-            mismatch_sql = f"""
-            CREATE OR REPLACE TABLE {mismatch_table} AS
-            {' UNION ALL '.join(mismatch_cases)}
-            """
-            
-            self.session.sql(mismatch_sql).collect()
-            
-            # Get count
-            count_result = self.session.sql(f"SELECT COUNT(*) as CNT FROM {mismatch_table}").collect()
-            mismatch_count = count_result[0]['CNT']
-            results['mismatch_count'] = mismatch_count
-            results['mismatch_table'] = mismatch_table
-            self.logger.info(f"Created {mismatch_table} with {mismatch_count:,} mismatch records")
-            
-            # 4. Create summary statistics table
-            summary_table = f"TABLE_VALIDATION_SUMMARY_{table1_alias}_VS_{table2_alias}_{self.timestamp}"
-            
-            # Get total row counts
-            table1_count = self.session.sql(f"SELECT COUNT(*) as CNT FROM {table1_name}").collect()[0]['CNT']
-            table2_count = self.session.sql(f"SELECT COUNT(*) as CNT FROM {table2_name}").collect()[0]['CNT']
-            
-            # Count unique mismatched rows (not individual column mismatches)
-            unique_mismatch_rows_sql = f"""
-            SELECT COUNT(DISTINCT CONCAT({', '.join([f"COALESCE(CAST({col} AS STRING), 'NULL')" for col in primary_key_columns])})) as CNT
-            FROM {mismatch_table}
-            """
-            unique_mismatch_rows = self.session.sql(unique_mismatch_rows_sql).collect()[0]['CNT']
-            
-            summary_sql = f"""
-            CREATE OR REPLACE TABLE {summary_table} AS
-            SELECT 
-                '{self.timestamp}' as TIMESTAMP,
-                '{table1_name}' as TABLE1_NAME,
-                '{table2_name}' as TABLE2_NAME,
-                '{table1_alias}' as TABLE1_ALIAS,
-                '{table2_alias}' as TABLE2_ALIAS,
-                {table1_count} as TOTAL_TABLE1_ROWS,
-                {table2_count} as TOTAL_TABLE2_ROWS,
-                {table1_only_count} as ROWS_ONLY_IN_TABLE1,
-                {table2_only_count} as ROWS_ONLY_IN_TABLE2,
-                {unique_mismatch_rows} as MISMATCHED_ROWS_COUNT,
-                {mismatch_count} as TOTAL_MISMATCH_DATA_POINTS,
-                '{', '.join(primary_key_columns)}' as PRIMARY_KEY_COLUMNS,
-                '{', '.join(comparison_columns)}' as COMPARISON_COLUMNS,
-                {len(comparison_columns)} as TOTAL_COMPARISON_COLUMNS,
-                'COMPLETE' as SAMPLE_TYPE,
-                CURRENT_TIMESTAMP() as VALIDATION_DATE,
-                'All records processed - no memory limits' as NOTE
-            """
-            
-            self.session.sql(summary_sql).collect()
-            results['summary_table'] = summary_table
-            
-            results.update({
-                'table1_count': table1_count,
-                'table2_count': table2_count,
-                'unique_mismatch_rows': unique_mismatch_rows,
-                'total_mismatch_data_points': mismatch_count,
+            summary_stats = {
+                'timestamp': self.timestamp,
+                'table1_name': table1_name,
+                'table2_name': table2_name,
+                'table1_alias': table1_alias,
+                'table2_alias': table2_alias,
+                'total_table1_rows': table1_info['row_count'],
+                'total_table2_rows': table2_info['row_count'],
+                'rows_only_in_table1': table1_only_count,
+                'rows_only_in_table2': table2_only_count,
+                'mismatched_rows_count': total_mismatch_rows,
+                'mismatched_data_points': len(mismatched_rows),
+                'estimated_total_mismatches': estimated_total_mismatches,
                 'primary_key_columns': primary_key_columns,
                 'comparison_columns': comparison_columns,
-                'validation_status': 'PASSED' if (table1_only_count == 0 and table2_only_count == 0 and unique_mismatch_rows == 0) else 'FAILED'
-            })
+                'total_comparison_columns': len(comparison_columns),
+                'max_sample_size': effective_sample_size,
+                'user_specified_columns': user_specified_columns,
+                'memory_strategy': 'user-optimized' if user_specified_columns else 'auto-conservative',
+                'validation_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'note': f'Results are {sampling_note}'
+            }
             
-            self.logger.info("✅ ALL TABLES CREATED SUCCESSFULLY - NO MEMORY LIMITS!")
-            self.logger.info(f"📊 Summary: {table1_count:,} vs {table2_count:,} rows, {unique_mismatch_rows:,} mismatched rows, {mismatch_count:,} total mismatches")
+            self.logger.info(f"Memory-optimized comparison completed:")
+            self.logger.info(f"  - Total {table1_alias} rows: {summary_stats['total_table1_rows']}")
+            self.logger.info(f"  - Total {table2_alias} rows: {summary_stats['total_table2_rows']}")
+            self.logger.info(f"  - {table1_alias} only rows: {table1_only_count} (sampled: {len(table1_only_rows)})")
+            self.logger.info(f"  - {table2_alias} only rows: {table2_only_count} (sampled: {len(table2_only_rows)})")
+            self.logger.info(f"  - Mismatched rows: {total_mismatch_rows} (sampled: {len(mismatched_rows)})")
+            self.logger.info(f"  - Comparison columns: {len(comparison_columns)}")
             
         except Exception as e:
-            self.logger.error(f"Error creating result tables: {str(e)}")
+            self.logger.error(f"Error during memory-optimized comparison: {str(e)}")
             raise
         
-        return results
+        return mismatched_rows, table1_only_rows, table2_only_rows, summary_stats
 
-    def create_stage_files_streaming(self, table1_name: str, table2_name: str,
-                                   primary_key_columns: List[str],
-                                   comparison_columns: List[str],
-                                   table1_alias: str = "SQL", 
-                                   table2_alias: str = "MDP",
-                                   stage_name: str = "@~/") -> Dict[str, str]:
+    def _compare_tables_streaming_all_records(self, table1_name: str, table2_name: str,
+                                            primary_key_columns: List[str],
+                                            comparison_columns: List[str],
+                                            table1_alias: str = "SQL", 
+                                            table2_alias: str = "MDP") -> Tuple[List[Dict], List[Dict], List[Dict], Dict]:
         """
-        Create CSV files in Snowflake stage directly from SQL without loading into memory
+        Streaming comparison that gets ALL records using pure SQL - NO memory limits
+        Creates temporary tables with results and returns counts only
         """
-        stage_files = {}
+        self.logger.info("🚀 STREAMING MODE: Processing ALL records with no memory limits")
+        
+        # Generate temporary table names
+        temp_mismatches = f"TEMP_MISMATCHES_{self.timestamp}"
+        temp_table1_only = f"TEMP_{table1_alias}_ONLY_{self.timestamp}"
+        temp_table2_only = f"TEMP_{table2_alias}_ONLY_{self.timestamp}"
         
         try:
+            table1_info = self.get_table_info(table1_name)
+            table2_info = self.get_table_info(table2_name)
+            
             # Build primary key join condition
             pk_join_conditions = []
             for col in primary_key_columns:
                 pk_join_conditions.append(f"COALESCE(CAST(t1.{col} AS STRING), 'NULL') = COALESCE(CAST(t2.{col} AS STRING), 'NULL')")
             pk_join_condition = " AND ".join(pk_join_conditions)
             
-            # Create file format for consistent CSV output
-            format_name = f"CSV_FORMAT_{self.timestamp}"
-            self.session.sql(f"DROP FILE FORMAT IF EXISTS {format_name}").collect()
-            self.session.sql(f"""
-                CREATE FILE FORMAT {format_name}
-                TYPE = 'CSV'
-                FIELD_DELIMITER = ','
-                RECORD_DELIMITER = '\\n'
-                SKIP_HEADER = 0
-                FIELD_OPTIONALLY_ENCLOSED_BY = '"'
-                NULL_IF = ('NULL', 'null')
-                EMPTY_FIELD_AS_NULL = FALSE
-                COMPRESSION = 'NONE'
-            """).collect()
-            
-            # 1. Export TABLE1-only rows
-            table1_only_file = f"table_validation_{table1_alias}_only_{self.timestamp}.csv"
-            self.logger.info(f"Exporting {table1_alias}-only rows to {stage_name}{table1_only_file}...")
-            
-            table1_only_export_sql = f"""
-            COPY INTO {stage_name}{table1_only_file}
-            FROM (
-                SELECT t1.*
-                FROM {table1_name} t1
-                LEFT JOIN {table2_name} t2 ON {pk_join_condition}
-                WHERE t2.{primary_key_columns[0]} IS NULL
-            )
-            FILE_FORMAT = (FORMAT_NAME = '{format_name}')
-            OVERWRITE = TRUE
-            HEADER = TRUE
+            # 1. Create table for TABLE1-only rows (ALL records)
+            self.logger.info(f"Creating complete {table1_alias}-only table...")
+            table1_only_sql = f"""
+            CREATE OR REPLACE TEMPORARY TABLE {temp_table1_only} AS
+            SELECT t1.*
+            FROM {table1_name} t1
+            LEFT JOIN {table2_name} t2 ON {pk_join_condition}
+            WHERE t2.{primary_key_columns[0]} IS NULL
             """
-            self.session.sql(table1_only_export_sql).collect()
-            stage_files[f'{table1_alias}_only'] = f"{stage_name}{table1_only_file}"
+            self.session.sql(table1_only_sql).collect()
+            table1_only_count = self.session.sql(f"SELECT COUNT(*) as CNT FROM {temp_table1_only}").collect()[0]['CNT']
             
-            # 2. Export TABLE2-only rows
-            table2_only_file = f"table_validation_{table2_alias}_only_{self.timestamp}.csv"
-            self.logger.info(f"Exporting {table2_alias}-only rows to {stage_name}{table2_only_file}...")
-            
-            table2_only_export_sql = f"""
-            COPY INTO {stage_name}{table2_only_file}
-            FROM (
-                SELECT t2.*
-                FROM {table2_name} t2
-                LEFT JOIN {table1_name} t1 ON {pk_join_condition}
-                WHERE t1.{primary_key_columns[0]} IS NULL
-            )
-            FILE_FORMAT = (FORMAT_NAME = '{format_name}')
-            OVERWRITE = TRUE
-            HEADER = TRUE
+            # 2. Create table for TABLE2-only rows (ALL records)
+            self.logger.info(f"Creating complete {table2_alias}-only table...")
+            table2_only_sql = f"""
+            CREATE OR REPLACE TEMPORARY TABLE {temp_table2_only} AS
+            SELECT t2.*
+            FROM {table2_name} t2
+            LEFT JOIN {table1_name} t1 ON {pk_join_condition}
+            WHERE t1.{primary_key_columns[0]} IS NULL
             """
-            self.session.sql(table2_only_export_sql).collect()
-            stage_files[f'{table2_alias}_only'] = f"{stage_name}{table2_only_file}"
+            self.session.sql(table2_only_sql).collect()
+            table2_only_count = self.session.sql(f"SELECT COUNT(*) as CNT FROM {temp_table2_only}").collect()[0]['CNT']
             
-            # 3. Export mismatches (unpivoted format)
-            mismatch_file = f"table_validation_mismatches_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
-            self.logger.info(f"Exporting mismatches to {stage_name}{mismatch_file}...")
-            
+            # 3. Create mismatches table (ALL records) using unpivoted approach
+            self.logger.info("Creating complete mismatches table...")
             pk_select = ", ".join([f"t1.{col}" for col in primary_key_columns])
+            
             mismatch_cases = []
             for col in comparison_columns:
                 mismatch_cases.append(f"""
@@ -413,76 +616,127 @@ class StreamingTableValidator:
                 WHERE COALESCE(CAST(t1.{col} AS STRING), 'NULL') != COALESCE(CAST(t2.{col} AS STRING), 'NULL')
                 """)
             
-            mismatch_export_sql = f"""
-            COPY INTO {stage_name}{mismatch_file}
-            FROM (
+            if mismatch_cases:
+                mismatch_sql = f"""
+                CREATE OR REPLACE TEMPORARY TABLE {temp_mismatches} AS
                 {' UNION ALL '.join(mismatch_cases)}
-            )
-            FILE_FORMAT = (FORMAT_NAME = '{format_name}')
-            OVERWRITE = TRUE
-            HEADER = TRUE
-            """
-            self.session.sql(mismatch_export_sql).collect()
-            stage_files['mismatches'] = f"{stage_name}{mismatch_file}"
+                """
+                self.session.sql(mismatch_sql).collect()
+                mismatch_count = self.session.sql(f"SELECT COUNT(*) as CNT FROM {temp_mismatches}").collect()[0]['CNT']
+                
+                # Count unique mismatched rows
+                unique_mismatch_sql = f"""
+                SELECT COUNT(DISTINCT CONCAT({', '.join([f"COALESCE(CAST({col} AS STRING), 'NULL')" for col in primary_key_columns])})) as CNT
+                FROM {temp_mismatches}
+                """
+                unique_mismatch_rows = self.session.sql(unique_mismatch_sql).collect()[0]['CNT']
+            else:
+                mismatch_count = 0
+                unique_mismatch_rows = 0
             
-            # Clean up file format
-            self.session.sql(f"DROP FILE FORMAT IF EXISTS {format_name}").collect()
+            # Store temp table names for later use
+            self._temp_tables = {
+                'mismatches': temp_mismatches,
+                'table1_only': temp_table1_only,
+                'table2_only': temp_table2_only
+            }
             
-            self.logger.info("✅ ALL STAGE FILES CREATED SUCCESSFULLY!")
+            summary_stats = {
+                'timestamp': self.timestamp,
+                'table1_name': table1_name,
+                'table2_name': table2_name,
+                'table1_alias': table1_alias,
+                'table2_alias': table2_alias,
+                'total_table1_rows': table1_info['row_count'],
+                'total_table2_rows': table2_info['row_count'],
+                'rows_only_in_table1': table1_only_count,
+                'rows_only_in_table2': table2_only_count,
+                'mismatched_rows_count': unique_mismatch_rows,
+                'mismatched_data_points': mismatch_count,
+                'estimated_total_mismatches': mismatch_count,
+                'primary_key_columns': primary_key_columns,
+                'comparison_columns': comparison_columns,
+                'total_comparison_columns': len(comparison_columns),
+                'max_sample_size': "ALL RECORDS",
+                'user_specified_columns': True,
+                'memory_strategy': 'streaming-all-records',
+                'validation_date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'note': 'ALL RECORDS processed - no sampling limits',
+                'temp_tables': self._temp_tables
+            }
+            
+            self.logger.info("✅ STREAMING COMPARISON COMPLETED:")
+            self.logger.info(f"  - Total {table1_alias} rows: {table1_info['row_count']:,}")
+            self.logger.info(f"  - Total {table2_alias} rows: {table2_info['row_count']:,}")
+            self.logger.info(f"  - {table1_alias} only rows: {table1_only_count:,}")
+            self.logger.info(f"  - {table2_alias} only rows: {table2_only_count:,}")
+            self.logger.info(f"  - Unique mismatched rows: {unique_mismatch_rows:,}")
+            self.logger.info(f"  - Total mismatch data points: {mismatch_count:,}")
+            
+            # Return empty lists since data is in temp tables
+            return [], [], [], summary_stats
             
         except Exception as e:
-            self.logger.error(f"Error creating stage files: {str(e)}")
-            # Clean up file format on error
-            try:
-                self.session.sql(f"DROP FILE FORMAT IF EXISTS {format_name}").collect()
-            except:
-                pass
+            self.logger.error(f"Error during streaming comparison: {str(e)}")
             raise
-        
-        return stage_files
 
-    def validate_tables_streaming(self, table1_name: str, table2_name: str,
-                                primary_key_columns: Optional[List[str]] = None,
-                                comparison_columns: Optional[List[str]] = None,
-                                table1_alias: str = "SQL", table2_alias: str = "MDP",
-                                environment: str = "SNOWFLAKE",
-                                create_tables: bool = True,
-                                create_stage_files: bool = True,
-                                stage_name: str = "@~/",
-                                max_auto_columns: int = 50) -> Dict[str, Any]:
+    def validate_tables(self, table1_name: str, table2_name: str,
+                       primary_key_columns: Optional[List[str]] = None,
+                       comparison_columns: Optional[List[str]] = None,
+                       table1_alias: str = "SQL", table2_alias: str = "MDP",
+                       environment: str = "SNOWFLAKE",
+                       create_tables: bool = True,
+                       stage_name: str = "@~/",
+                       max_sample_size = None,
+                       max_auto_columns: int = None) -> Dict[str, Any]:
         """
-        Memory-efficient streaming validation that processes ALL records without memory limits
-        
-        This approach:
-        1. Uses pure SQL operations in Snowflake
-        2. Never loads large datasets into Python memory
-        3. Creates complete result tables with ALL records
-        4. Provides comprehensive comparison results
+        Enhanced table validation with smart sampling based on column specification
         
         Args:
             table1_name: Name of first table
             table2_name: Name of second table
             primary_key_columns: List of columns to use as primary keys
-            comparison_columns: List of specific columns to compare
+            comparison_columns: List of specific columns to compare (if None, uses auto-detection)
             table1_alias: Alias for first table
             table2_alias: Alias for second table
             environment: Environment name
-            create_tables: Whether to create result tables in Snowflake
-            create_stage_files: Whether to create CSV files in stage
+            create_tables: Whether to create result tables
             stage_name: Snowflake stage for output files
-            max_auto_columns: Maximum columns for auto-detection
+            max_sample_size: None=auto-decide, int=specific limit, False=unlimited (user-controllable)
+            max_auto_columns: None=default(50), int=user-specified limit for auto-detection
             
         Returns:
-            Dictionary with validation results including ALL records
+            Dictionary with validation results
         """
+        # Smart defaults based on user input
+        if max_sample_size is None:
+            # Auto-decide based on whether user specified columns
+            if comparison_columns:
+                final_max_sample_size = False  # Unlimited when user specifies columns
+            else:
+                final_max_sample_size = 1000   # Conservative default for auto-detection
+        else:
+            # User explicitly set it
+            final_max_sample_size = max_sample_size
+        
+        if max_auto_columns is None:
+            final_max_auto_columns = 50  # Default
+        else:
+            final_max_auto_columns = max_auto_columns
+            
         self.logger.info("="*80)
-        self.logger.info("STARTING STREAMING TABLE VALIDATION (NO MEMORY LIMITS)")
+        self.logger.info("STARTING MEMORY-OPTIMIZED TABLE VALIDATION")
         self.logger.info("="*80)
         self.logger.info(f"Table 1 ({table1_alias}): {table1_name}")
         self.logger.info(f"Table 2 ({table2_alias}): {table2_name}")
         self.logger.info(f"Environment: {environment}")
-        self.logger.info(f"Processing: ALL RECORDS (no sampling)")
+        self.logger.info(f"Primary Key Columns: {primary_key_columns}")
+        self.logger.info(f"Comparison Columns: {comparison_columns if comparison_columns else f'Auto-detect (max {final_max_auto_columns})'}")
+        self.logger.info(f"Max Sample Size: {'Auto-decided' if max_sample_size is None else ('False (unlimited)' if final_max_sample_size is False else final_max_sample_size)}")
         self.logger.info(f"Timestamp: {self.timestamp}")
+        
+        # Determine if user specified columns
+        user_specified_columns = comparison_columns is not None
         
         # Get table information
         table1_info = self.get_table_info(table1_name)
@@ -509,115 +763,388 @@ class StreamingTableValidator:
             return None
         
         # Identify comparison columns
-        comp_columns = self.identify_comparison_columns(table1_info, table2_info, pk_columns, comparison_columns, max_auto_columns)
+        comp_columns = self.identify_comparison_columns(table1_info, table2_info, pk_columns, comparison_columns, final_max_auto_columns)
         if not comp_columns:
             self.logger.error("No valid comparison columns identified")
             return None
         
-        self.logger.info(f"Primary Keys: {', '.join(pk_columns)}")
-        self.logger.info(f"Comparison Columns ({len(comp_columns)}): {', '.join(comp_columns[:10])}{'...' if len(comp_columns) > 10 else ''}")
+        # Run memory-optimized comparison
+        mismatched_rows, table1_only_rows, table2_only_rows, summary_stats = self.compare_tables_memory_optimized(
+            table1_name, table2_name, pk_columns, comp_columns, table1_alias, table2_alias, final_max_sample_size, user_specified_columns
+        )
         
+        # Handle streaming mode results
+        is_streaming_mode = summary_stats.get('memory_strategy') == 'streaming-all-records'
+        
+        # Generate output file names
+        mismatch_table_name = f"TABLE_VALIDATION_MISMATCHES_{table1_alias}_VS_{table2_alias}_{self.timestamp}"
+        table1_only_table_name = f"TABLE_VALIDATION_{table1_alias}_ONLY_{self.timestamp}"
+        table2_only_table_name = f"TABLE_VALIDATION_{table2_alias}_ONLY_{self.timestamp}"
+        mismatch_csv = f"table_validation_mismatches_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
+        table1_only_csv = f"table_validation_{table1_alias}_only_{self.timestamp}.csv"
+        table2_only_csv = f"table_validation_{table2_alias}_only_{self.timestamp}.csv"
+        summary_csv = f"table_validation_summary_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
+        
+        # Create tables if requested
+        created_tables = {}
+        if create_tables:
+            if is_streaming_mode:
+                # In streaming mode, copy from temp tables to permanent tables
+                temp_tables = summary_stats.get('temp_tables', {})
+                
+                if temp_tables.get('mismatches') and summary_stats['mismatched_data_points'] > 0:
+                    self.session.sql(f"""
+                        CREATE OR REPLACE TABLE {mismatch_table_name} AS
+                        SELECT * FROM {temp_tables['mismatches']}
+                    """).collect()
+                    created_tables['mismatches'] = mismatch_table_name
+                    self.logger.info(f"Created permanent table: {mismatch_table_name} with {summary_stats['mismatched_data_points']:,} rows")
+                
+                if temp_tables.get('table1_only') and summary_stats['rows_only_in_table1'] > 0:
+                    self.session.sql(f"""
+                        CREATE OR REPLACE TABLE {table1_only_table_name} AS
+                        SELECT * FROM {temp_tables['table1_only']}
+                    """).collect()
+                    created_tables[f'{table1_alias}_only'] = table1_only_table_name
+                    self.logger.info(f"Created permanent table: {table1_only_table_name} with {summary_stats['rows_only_in_table1']:,} rows")
+                
+                if temp_tables.get('table2_only') and summary_stats['rows_only_in_table2'] > 0:
+                    self.session.sql(f"""
+                        CREATE OR REPLACE TABLE {table2_only_table_name} AS
+                        SELECT * FROM {temp_tables['table2_only']}
+                    """).collect()
+                    created_tables[f'{table2_alias}_only'] = table2_only_table_name
+                    self.logger.info(f"Created permanent table: {table2_only_table_name} with {summary_stats['rows_only_in_table2']:,} rows")
+            else:
+                # Original approach for sampled data
+                if mismatched_rows:
+                    self.create_snowflake_table(mismatch_table_name, mismatched_rows)
+                    created_tables['mismatches'] = mismatch_table_name
+                if table1_only_rows:
+                    self.create_snowflake_table(table1_only_table_name, table1_only_rows)
+                    created_tables[f'{table1_alias}_only'] = table1_only_table_name
+                if table2_only_rows:
+                    self.create_snowflake_table(table2_only_table_name, table2_only_rows)
+                    created_tables[f'{table2_alias}_only'] = table2_only_table_name
+        
+        # Write to stage files
+        stage_files = {}
+        if is_streaming_mode:
+            # In streaming mode, export directly from temp tables
+            temp_tables = summary_stats.get('temp_tables', {})
+            self._write_streaming_stage_files(temp_tables, stage_name, table1_alias, table2_alias, summary_stats)
+            stage_files = {
+                'mismatches': f"{stage_name}{mismatch_csv}",
+                f'{table1_alias}_only': f"{stage_name}{table1_only_csv}",
+                f'{table2_alias}_only': f"{stage_name}{table2_only_csv}",
+                'summary': f"{stage_name}{summary_csv}"
+            }
+        else:
+            # Original approach for sampled data
+            if mismatched_rows:
+                self.write_to_snowflake_stage(mismatched_rows, mismatch_csv, stage_name)
+                stage_files['mismatches'] = f"{stage_name}{mismatch_csv}"
+            if table1_only_rows:
+                self.write_to_snowflake_stage(table1_only_rows, table1_only_csv, stage_name)
+                stage_files[f'{table1_alias}_only'] = f"{stage_name}{table1_only_csv}"
+            if table2_only_rows:
+                self.write_to_snowflake_stage(table2_only_rows, table2_only_csv, stage_name)
+                stage_files[f'{table2_alias}_only'] = f"{stage_name}{table2_only_csv}"
+            
+            self.write_to_snowflake_stage([summary_stats], summary_csv, stage_name)
+            stage_files['summary'] = f"{stage_name}{summary_csv}"
+        
+        # Determine validation status
+        validation_passed = (
+            summary_stats.get('mismatched_rows_count', len(mismatched_rows)) == 0 and 
+            summary_stats.get('rows_only_in_table1', len(table1_only_rows)) == 0 and 
+            summary_stats.get('rows_only_in_table2', len(table2_only_rows)) == 0 and
+            len(validation_issues) == 0
+        )
+        
+        # Build results
         results = {
-            'validation_status': 'IN_PROGRESS',
+            'validation_status': 'PASSED' if validation_passed else 'FAILED',
             'timestamp': self.timestamp,
             'environment': environment,
             'table1_info': table1_info,
             'table2_info': table2_info,
             'validation_issues': validation_issues,
-            'primary_key_columns': pk_columns,
-            'comparison_columns': comp_columns,
-            'created_tables': {},
-            'stage_files': {}
+            'summary_statistics': summary_stats,
+            'results_summary': {
+                'mismatched_rows_count': summary_stats.get('mismatched_rows_count', len(mismatched_rows)),
+                f'{table1_alias}_only_rows_count': summary_stats.get('rows_only_in_table1', len(table1_only_rows)),
+                f'{table2_alias}_only_rows_count': summary_stats.get('rows_only_in_table2', len(table2_only_rows)),
+                'total_issues_found': summary_stats.get('mismatched_rows_count', len(mismatched_rows)) + summary_stats.get('rows_only_in_table1', len(table1_only_rows)) + summary_stats.get('rows_only_in_table2', len(table2_only_rows))
+            },
+            'created_tables': created_tables if create_tables else None,
+            'stage_files': stage_files
         }
-        
-        try:
-            # Create result tables directly in Snowflake (no memory usage)
-            if create_tables:
-                self.logger.info("Creating comprehensive result tables...")
-                table_results = self.create_result_tables_directly(
-                    table1_name, table2_name, pk_columns, comp_columns, table1_alias, table2_alias
-                )
-                results['created_tables'] = {
-                    'mismatches': table_results['mismatch_table'],
-                    f'{table1_alias}_only': table_results['table1_only_table'],
-                    f'{table2_alias}_only': table_results['table2_only_table'],
-                    'summary': table_results['summary_table']
-                }
-                results['summary_statistics'] = table_results
-            
-            # Create stage files directly from SQL (no memory usage)
-            if create_stage_files:
-                self.logger.info("Creating stage files...")
-                stage_results = self.create_stage_files_streaming(
-                    table1_name, table2_name, pk_columns, comp_columns, table1_alias, table2_alias, stage_name
-                )
-                results['stage_files'] = stage_results
-            
-            # Determine final validation status
-            if create_tables:
-                stats = results['summary_statistics']
-                validation_passed = (
-                    stats['table1_only_count'] == 0 and 
-                    stats['table2_only_count'] == 0 and 
-                    stats['unique_mismatch_rows'] == 0 and
-                    len(validation_issues) == 0
-                )
-                results['validation_status'] = 'PASSED' if validation_passed else 'FAILED'
-                
-                results['results_summary'] = {
-                    'mismatched_rows_count': stats['unique_mismatch_rows'],
-                    f'{table1_alias}_only_rows_count': stats['table1_only_count'],
-                    f'{table2_alias}_only_rows_count': stats['table2_only_count'],
-                    'total_issues_found': stats['table1_only_count'] + stats['table2_only_count'] + stats['unique_mismatch_rows']
-                }
-            else:
-                results['validation_status'] = 'COMPLETED_NO_TABLES'
-            
-            self.logger.info("="*80)
-            self.logger.info("✅ STREAMING VALIDATION COMPLETED SUCCESSFULLY!")
-            self.logger.info("✅ ALL RECORDS PROCESSED - NO MEMORY LIMITATIONS!")
-            self.logger.info("="*80)
-            
-        except Exception as e:
-            self.logger.error(f"Error during streaming validation: {str(e)}")
-            results['validation_status'] = 'ERROR'
-            results['error'] = str(e)
-            raise
         
         return results
 
-    def print_streaming_validation_report(self, results: Dict[str, Any]):
+    def _write_streaming_stage_files(self, temp_tables: Dict, stage_name: str, table1_alias: str, table2_alias: str, summary_stats: Dict):
         """
-        Print a comprehensive report for streaming validation results
+        Write stage files directly from temp tables for streaming mode
+        """
+        try:
+            # Create file format
+            format_name = f"CSV_FORMAT_{self.timestamp}"
+            self.session.sql(f"DROP FILE FORMAT IF EXISTS {format_name}").collect()
+            self.session.sql(f"""
+                CREATE FILE FORMAT {format_name}
+                TYPE = 'CSV'
+                FIELD_DELIMITER = ','
+                RECORD_DELIMITER = '\\n'
+                SKIP_HEADER = 0
+                FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+                NULL_IF = ('NULL', 'null')
+                EMPTY_FIELD_AS_NULL = FALSE
+                COMPRESSION = 'NONE'
+            """).collect()
+            
+            # Export mismatches
+            if temp_tables.get('mismatches') and summary_stats['mismatched_data_points'] > 0:
+                mismatch_file = f"table_validation_mismatches_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
+                self.session.sql(f"""
+                    COPY INTO {stage_name}{mismatch_file}
+                    FROM {temp_tables['mismatches']}
+                    FILE_FORMAT = (FORMAT_NAME = '{format_name}')
+                    OVERWRITE = TRUE
+                    HEADER = TRUE
+                """).collect()
+                self.logger.info(f"Exported streaming mismatches to {stage_name}{mismatch_file}")
+            
+            # Export table1-only
+            if temp_tables.get('table1_only') and summary_stats['rows_only_in_table1'] > 0:
+                table1_file = f"table_validation_{table1_alias}_only_{self.timestamp}.csv"
+                self.session.sql(f"""
+                    COPY INTO {stage_name}{table1_file}
+                    FROM {temp_tables['table1_only']}
+                    FILE_FORMAT = (FORMAT_NAME = '{format_name}')
+                    OVERWRITE = TRUE
+                    HEADER = TRUE
+                """).collect()
+                self.logger.info(f"Exported streaming {table1_alias}-only to {stage_name}{table1_file}")
+            
+            # Export table2-only
+            if temp_tables.get('table2_only') and summary_stats['rows_only_in_table2'] > 0:
+                table2_file = f"table_validation_{table2_alias}_only_{self.timestamp}.csv"
+                self.session.sql(f"""
+                    COPY INTO {stage_name}{table2_file}
+                    FROM {temp_tables['table2_only']}
+                    FILE_FORMAT = (FORMAT_NAME = '{format_name}')
+                    OVERWRITE = TRUE
+                    HEADER = TRUE
+                """).collect()
+                self.logger.info(f"Exported streaming {table2_alias}-only to {stage_name}{table2_file}")
+            
+            # Export summary
+            summary_file = f"table_validation_summary_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
+            self.write_to_snowflake_stage([summary_stats], summary_file, stage_name)
+            
+            # Clean up format
+            self.session.sql(f"DROP FILE FORMAT IF EXISTS {format_name}").collect()
+            
+        except Exception as e:
+            self.logger.error(f"Error writing streaming stage files: {str(e)}")
+            try:
+                self.session.sql(f"DROP FILE FORMAT IF EXISTS {format_name}").collect()
+            except:
+                pass
+
+    def print_sample_mismatches(self, table1_name: str, table2_name: str,
+                               primary_key_columns: Optional[List[str]] = None,
+                               comparison_columns: Optional[List[str]] = None,
+                               table1_alias: str = "SQL", 
+                               table2_alias: str = "MDP",
+                               sample_size: int = 10,
+                               max_auto_columns: int = 50) -> List[Dict]:
+        """
+        Print sample mismatches for verification with column filtering
+        
+        Args:
+            table1_name: Name of first table
+            table2_name: Name of second table
+            primary_key_columns: List of columns to use as primary keys
+            comparison_columns: List of specific columns to compare
+            table1_alias: Alias for first table
+            table2_alias: Alias for second table
+            sample_size: Number of sample mismatches to show
+            max_auto_columns: Maximum columns for auto-detection (when comparison_columns is None)
+            
+        Returns:
+            List of sample mismatch records
+        """
+        print(f"\n SAMPLE MISMATCHES VERIFICATION ({sample_size} samples)")
+        print("="*70)
+        
+        sample_mismatches = []
+        
+        try:
+            # Get table information
+            table1_info = self.get_table_info(table1_name)
+            table2_info = self.get_table_info(table2_name)
+            
+            if not table1_info or not table2_info:
+                print(" Error: Could not get table information")
+                return sample_mismatches
+            
+            # Identify primary key columns
+            pk_columns = self.identify_primary_key_columns(table1_info, table2_info, primary_key_columns)
+            if not pk_columns:
+                print(" Error: No valid primary key columns identified")
+                return sample_mismatches
+            
+            # Identify comparison columns
+            comp_columns = self.identify_comparison_columns(table1_info, table2_info, pk_columns, comparison_columns, max_auto_columns)
+            if not comp_columns:
+                print(" Error: No valid comparison columns identified")
+                return sample_mismatches
+            
+            # Limit comparison columns for sample verification (only if auto-detected)
+            if comparison_columns:
+                limited_comp_columns = comp_columns  # Use all user-specified columns
+                print(f" Using user-specified columns: {', '.join(limited_comp_columns)}")
+            else:
+                limited_comp_columns = comp_columns[:5]  # Only check first 5 columns for auto-detected samples
+                print(f" Using auto-detected columns (limited for sample): {', '.join(limited_comp_columns)}")
+            
+            print(f" Primary Keys: {', '.join(pk_columns)}")
+            print()
+            
+            # Create temporary views
+            table1_df = self.session.table(table1_name)
+            table2_df = self.session.table(table2_name)
+            table1_df.create_or_replace_temp_view("temp_sample_table1")
+            table2_df.create_or_replace_temp_view("temp_sample_table2")
+            
+            # Build primary key join condition
+            pk_join_conditions = []
+            for col in pk_columns:
+                pk_join_conditions.append(f"COALESCE(CAST(t1.{col} AS STRING), 'NULL') = COALESCE(CAST(t2.{col} AS STRING), 'NULL')")
+            pk_join_condition = " AND ".join(pk_join_conditions)
+            
+            # Build select and comparison conditions
+            select_columns = []
+            comparison_conditions = []
+            
+            # Add primary key columns
+            for col in pk_columns:
+                select_columns.append(f"t1.{col}")
+            
+            # Add comparison columns with both table values
+            for col in limited_comp_columns:
+                select_columns.extend([f"t1.{col} as {table1_alias}_{col}", f"t2.{col} as {table2_alias}_{col}"])
+                comparison_conditions.append(f"(COALESCE(CAST(t1.{col} AS STRING), 'NULL') != COALESCE(CAST(t2.{col} AS STRING), 'NULL'))")
+            
+            # Build sample mismatch query
+            sample_sql = f"""
+            SELECT {', '.join(select_columns)}
+            FROM temp_sample_table1 t1
+            INNER JOIN temp_sample_table2 t2 ON {pk_join_condition}
+            WHERE {' OR '.join(comparison_conditions)}
+            LIMIT {sample_size}
+            """
+            
+            result = self.session.sql(sample_sql)
+            sample_df = result.to_pandas()
+            
+            if len(sample_df) == 0:
+                print(" No mismatches found in sample data - tables appear to match!")
+                return sample_mismatches
+            
+            print(f"Found {len(sample_df)} sample mismatches:\n")
+            
+            # Process and display each sample
+            for idx, row in sample_df.iterrows():
+                # Extract primary key values
+                pk_values = {}
+                for col in pk_columns:
+                    pk_values[col] = row[col]
+                
+                print(f"Sample {idx + 1}:")
+                print(f"  Primary Key: {', '.join([f'{k}={v}' for k, v in pk_values.items()])}")
+                
+                # Check each comparison column for differences
+                differences_found = []
+                for col in limited_comp_columns:
+                    table1_val = row.get(f'{table1_alias}_{col}')
+                    table2_val = row.get(f'{table2_alias}_{col}')
+                    
+                    # Check if values are different
+                    if pd.isna(table1_val) and pd.isna(table2_val):
+                        continue  # Both are null, no difference
+                    elif pd.isna(table1_val) or pd.isna(table2_val) or str(table1_val) != str(table2_val):
+                        differences_found.append({
+                            'column': col,
+                            'table1_value': table1_val if pd.notna(table1_val) else 'NULL',
+                            'table2_value': table2_val if pd.notna(table2_val) else 'NULL'
+                        })
+                        print(f"    ✓ {col}: {table1_alias}='{table1_val}' vs {table2_alias}='{table2_val}'")
+                
+                # Store sample record
+                sample_record = {
+                    **pk_values,
+                    'differences': differences_found,
+                    'total_differences': len(differences_found)
+                }
+                sample_mismatches.append(sample_record)
+                print()  # Add blank line between samples
+            
+            print(f" Verification complete! Found {len(sample_mismatches)} records with differences.")
+            print(f" Columns compared: {', '.join(limited_comp_columns)}")
+            print(f" Primary keys used: {', '.join(pk_columns)}")
+            
+        except Exception as e:
+            self.logger.error(f"Error during sample verification: {str(e)}")
+            print(f" Error during sample verification: {str(e)}")
+        
+        return sample_mismatches
+
+    def print_validation_report(self, results: Dict[str, Any]):
+        """
+        Print a comprehensive validation report
+        
+        Args:
+            results: Results dictionary from validation
         """
         print("\n" + "="*80)
-        print("STREAMING TABLE VALIDATION REPORT (ALL RECORDS)")
+        print("MEMORY-OPTIMIZED TABLE VALIDATION REPORT")
         print("="*80)
         print(f"Timestamp: {results['timestamp']}")
         print(f"Environment: {results['environment']}")
         print(f"Validation Status: {results['validation_status']}")
         
-        if 'summary_statistics' in results:
-            stats = results['summary_statistics']
-            print(f"\nTable Information:")
-            print(f"  Table 1: {results['table1_info']['table_name']}")
-            print(f"    - Row Count: {stats['table1_count']:,}")
-            print(f"  Table 2: {results['table2_info']['table_name']}")
-            print(f"    - Row Count: {stats['table2_count']:,}")
-            
-            summary = results['results_summary']
-            print(f"\nValidation Results (ALL RECORDS):")
+        stats = results['summary_statistics']
+        print(f"\nTable Information:")
+        print(f"  {stats['table1_alias']} Table: {stats['table1_name']}")
+        print(f"    - Row Count: {stats['total_table1_rows']:,}")
+        print(f"  {stats['table2_alias']} Table: {stats['table2_name']}")
+        print(f"    - Row Count: {stats['total_table2_rows']:,}")
+        
+        summary = results['results_summary']
+        table1_alias = stats['table1_alias']
+        table2_alias = stats['table2_alias']
+        
+        print(f"\nValidation Results:")
+        if stats.get('memory_strategy') == 'streaming-all-records':
+            print(f"  ✅ STREAMING MODE: ALL RECORDS PROCESSED")
             print(f"  Unique Mismatched Rows: {summary['mismatched_rows_count']:,}")
-            print(f"  Total Mismatch Data Points: {stats['total_mismatch_data_points']:,}")
-            print(f"  Rows only in {stats['table1_alias']}: {summary[f\"{stats['table1_alias']}_only_rows_count\"]:,}")
-            print(f"  Rows only in {stats['table2_alias']}: {summary[f\"{stats['table2_alias']}_only_rows_count\"]:,}")
-            print(f"  Total Issues Found: {summary['total_issues_found']:,}")
-            
-            print(f"\nProcessing Details:")
-            print(f"  Processing Method: Pure SQL (No Memory Limits)")
-            print(f"  Comparison Columns: {len(results['comparison_columns'])} columns")
-            print(f"  Selected Columns: {', '.join(results['comparison_columns'][:10])}{'...' if len(results['comparison_columns']) > 10 else ''}")
-            print(f"  Primary Key Columns: {', '.join(results['primary_key_columns'])}")
+            print(f"  Total Mismatch Data Points: {stats['mismatched_data_points']:,}")
+        else:
+            print(f"  Data Mismatches: {summary['mismatched_rows_count']:,} (sampled)")
+        
+        print(f"  Rows only in {table1_alias}: {summary[f'{table1_alias}_only_rows_count']:,}")
+        print(f"  Rows only in {table2_alias}: {summary[f'{table2_alias}_only_rows_count']:,}")
+        print(f"  Total Issues Found: {summary['total_issues_found']:,}")
+        
+        print(f"\nMemory Optimization Settings:")
+        print(f"  Max Sample Size: {stats['max_sample_size']}")
+        print(f"  Memory Strategy: {stats.get('memory_strategy', 'default')}")
+        print(f"  User Specified Columns: {stats.get('user_specified_columns', False)}")
+        print(f"  Comparison Columns: {stats['total_comparison_columns']} columns")
+        print(f"  Selected Columns: {', '.join(stats['comparison_columns'][:10])}{'...' if len(stats['comparison_columns']) > 10 else ''}")
         
         if results.get('validation_issues'):
             print(f"\nValidation Issues:")
@@ -625,61 +1152,69 @@ class StreamingTableValidator:
                 print(f"  - {issue['type']}: {issue.get('missing_columns', 'N/A')} ({issue['severity']})")
         
         if results.get('created_tables'):
-            print(f"\nCreated Snowflake Tables (Complete Data):")
+            print(f"\nCreated Snowflake Tables:")
             for table_type, table_name in results['created_tables'].items():
                 print(f"  {table_type}: {table_name}")
         
-        if results.get('stage_files'):
-            print(f"\nSnowflake Stage Files (Complete Data):")
-            for file_type, filepath in results['stage_files'].items():
-                print(f"  {file_type}: {filepath}")
+        print(f"\nSnowflake Stage Files:")
+        for file_type, filepath in results['stage_files'].items():
+            print(f"  {file_type}: {filepath}")
         
-        print(f"\n" + "="*80)
-        print("KEY ADVANTAGES OF STREAMING APPROACH")
-        print("="*80)
-        print("✅ NO MEMORY LIMITATIONS - Processes tables of any size")
-        print("✅ ALL RECORDS INCLUDED - No sampling or truncation") 
-        print("✅ PURE SQL PROCESSING - Leverages Snowflake's compute power")
-        print("✅ COMPLETE RESULTS - Full datasets in tables and files")
-        print("✅ SCALABLE SOLUTION - Works with billions of rows")
+        print(f"\nComparison Details:")
+        print(f"  Primary Key Columns: {', '.join(stats['primary_key_columns'])}")
+        print(f"  Validation Date: {stats['validation_date']}")
         
+        # Add note about sampling
+        if 'note' in stats:
+            print(f"\n Note: {stats['note']}")
+        
+        # Show verification option with enhanced guidance
         print(f"\n" + "="*80)
-        print("NEXT STEPS")
+        print("VERIFICATION & CUSTOMIZATION OPTIONS")
         print("="*80)
-        print("1. Query result tables directly for detailed analysis")
-        print("2. Download CSV files from stage for external analysis") 
-        print("3. Use result tables for further processing or reporting")
-        print("4. All mismatches are in unpivoted format for easy analysis")
+        print("To verify results or customize comparison:")
+        print("1. Verify: validator.print_sample_mismatches(table1, table2, pk_cols, comp_cols, alias1, alias2, 10)")
+        
+        if stats.get('memory_strategy') == 'streaming-all-records':
+            print("2. ✅ STREAMING MODE - ALL records processed with no memory limits")
+        elif stats.get('user_specified_columns'):
+            print("2. ✅ You used specific columns - memory usage is optimized")
+        else:
+            print("2. Specify columns: Use comparison_columns=['COL1', 'COL2'] for better memory control")
+            print("3. Adjust auto-limit: Use max_auto_columns=100 to process more columns automatically")
+        
+        print(f"4. Memory control: Current max_sample_size={stats['max_sample_size']} ({'unlimited when columns specified' if stats.get('user_specified_columns') else 'adjust as needed'})")
+        print("5. For ALL records: Set max_sample_size=False to enable streaming mode")
 
 
-def validate_tables_streaming_sp(session: Session, 
-                               table1_name: str, 
-                               table2_name: str,
-                               primary_key_columns: str = None,
-                               comparison_columns: str = None,
-                               table1_alias: str = "SQL",
-                               table2_alias: str = "MDP", 
-                               environment: str = "SNOWFLAKE",
-                               create_tables: bool = True,
-                               create_stage_files: bool = True,
-                               stage_name: str = "@~/",
-                               max_auto_columns: int = 50) -> str:
+def validate_tables_sp(session: Session, 
+                      table1_name: str, 
+                      table2_name: str,
+                      primary_key_columns: str = None,
+                      comparison_columns: str = None,
+                      table1_alias: str = "SQL",
+                      table2_alias: str = "MDP", 
+                      environment: str = "SNOWFLAKE",
+                      create_tables: bool = True,
+                      stage_name: str = "@~/",
+                      max_sample_size = None,
+                      max_auto_columns: int = None) -> str:
     """
-    Stored procedure version for streaming validation with no memory limits
+    Stored procedure version with smart sampling logic
     
     Args:
         session: Snowpark session
         table1_name: Fully qualified name of first table
         table2_name: Fully qualified name of second table
         primary_key_columns: Comma-separated list of primary key column names
-        comparison_columns: Comma-separated list of columns to compare
-        table1_alias: Alias for first table
-        table2_alias: Alias for second table
+        comparison_columns: Comma-separated list of columns to compare (when provided, defaults max_sample_size to False)
+        table1_alias: Alias for first table (default: SQL for dev)
+        table2_alias: Alias for second table (default: MDP for prod)
         environment: Database environment
         create_tables: Whether to create result tables
-        create_stage_files: Whether to create stage files
         stage_name: Snowflake stage for output files
-        max_auto_columns: Maximum columns for auto-detection
+        max_sample_size: None=auto-decide, int=specific limit, False=unlimited (user-controllable)
+        max_auto_columns: None=default(50), int=user-specified limit for auto-detection
     
     Returns:
         Validation results summary as string
@@ -695,11 +1230,27 @@ def validate_tables_streaming_sp(session: Session,
         if comparison_columns:
             comp_columns = [col.strip().upper() for col in comparison_columns.split(',')]
         
-        # Create streaming validator
-        validator = StreamingTableValidator(session)
+        # Smart defaults based on user input
+        if max_sample_size is None:
+            # Auto-decide based on whether user specified columns
+            if comp_columns:
+                final_max_sample_size = False  # Unlimited when user specifies columns
+            else:
+                final_max_sample_size = 1000   # Conservative default for auto-detection
+        else:
+            # User explicitly set it
+            final_max_sample_size = max_sample_size
         
-        # Run streaming validation (no memory limits)
-        results = validator.validate_tables_streaming(
+        if max_auto_columns is None:
+            final_max_auto_columns = 50  # Default
+        else:
+            final_max_auto_columns = max_auto_columns
+        
+        # Create validator
+        validator = GenericTableValidator(session)
+        
+        # Run memory-optimized validation
+        results = validator.validate_tables(
             table1_name=table1_name,
             table2_name=table2_name,
             primary_key_columns=pk_columns,
@@ -708,150 +1259,92 @@ def validate_tables_streaming_sp(session: Session,
             table2_alias=table2_alias,
             environment=environment,
             create_tables=create_tables,
-            create_stage_files=create_stage_files,
             stage_name=stage_name,
-            max_auto_columns=max_auto_columns
+            max_sample_size=final_max_sample_size,
+            max_auto_columns=final_max_auto_columns
         )
         
-        if results and 'summary_statistics' in results:
+        if results:
             summary = results['results_summary']
             stats = results['summary_statistics']
+            table1_alias = stats['table1_alias']
+            table2_alias = stats['table2_alias']
             
             return f"""
-Streaming Table Validation {results['validation_status']} - ALL RECORDS PROCESSED
-Environment: {results['environment']}
-{stats['table1_alias']} ({results['table1_info']['table_name']}): {stats['table1_count']:,} rows
-{stats['table2_alias']} ({results['table2_info']['table_name']}): {stats['table2_count']:,} rows
-Unique Mismatched Rows: {summary['mismatched_rows_count']:,}
-Total Mismatch Data Points: {stats['total_mismatch_data_points']:,}
-{stats['table1_alias']} Only: {summary[f"{stats['table1_alias']}_only_rows_count"]:,}
-{stats['table2_alias']} Only: {summary[f"{stats['table2_alias']}_only_rows_count"]:,}
-Total Issues: {summary['total_issues_found']:,}
-Primary Keys: {', '.join(results['primary_key_columns'])}
-Comparison Columns: {len(results['comparison_columns'])}
-Processing: Pure SQL - No Memory Limits - Complete Dataset
-                    """.strip()
+                    Table Validation {results['validation_status']}
+                    Environment: {results['environment']}
+                    {table1_alias} ({stats['table1_name']}): {stats['total_table1_rows']:,} rows
+                    {table2_alias} ({stats['table2_name']}): {stats['total_table2_rows']:,} rows
+                    Mismatches: {summary['mismatched_rows_count']:,}
+                    {table1_alias} Only: {summary[f'{table1_alias}_only_rows_count']:,}
+                    {table2_alias} Only: {summary[f'{table2_alias}_only_rows_count']:,}
+                    Total Issues: {summary['total_issues_found']:,}
+                    Primary Keys: {', '.join(stats['primary_key_columns'])}
+                    Comparison Columns: {stats['total_comparison_columns']}
+                    Memory Strategy: {stats.get('memory_strategy', 'default')}
+                    Sample Size: {stats['max_sample_size']}
+                                """.strip()
         else:
-            return f"Streaming table validation {results.get('validation_status', 'failed')} to complete"
+            return "Table validation failed to complete"
             
     except Exception as e:
-        return f"Error during streaming table validation: {str(e)}"
+        return f"Error during table validation: {str(e)}"
 
 
-def main_streaming():
+def main():
     """
-    Main function for testing the streaming table validator
-    Processes ALL records without memory limitations
+    Main function for testing the memory-optimized table validator
     """
     try:
-        validator = StreamingTableValidator()
+        validator = GenericTableValidator()
         
-        print("🚀 TESTING STREAMING TABLE VALIDATOR (NO MEMORY LIMITS)")
-        print("="*80)
-        
-        # Run comprehensive streaming validation
-        results = validator.validate_tables_streaming(
+        # Sample mismatches with enhanced column control
+        print(" STEP 1: Verifying script functionality with sample mismatches...")
+        sample_mismatches = validator.print_sample_mismatches(
             table1_name='BCBSND_CONFORMED_DEV.OUTBOUND.MEMBER_ENROLLMENT_MASTER',
             table2_name='BCBSND_CONFORMED_DEV.OUTBOUND.MEMBER_ENROLLMENT_MASTER_PROD',
             primary_key_columns=['MEMBER_ID'],
             comparison_columns=None,  # Auto-detect or specify ['COL1', 'COL2'] for specific columns
             table1_alias='SQL',
             table2_alias='MDP',
-            environment='SNOWFLAKE_DEV',
-            create_tables=True,        # Creates complete result tables
-            create_stage_files=True,   # Creates complete CSV files
-            stage_name='@~/',
-            max_auto_columns=50        # Adjust as needed for auto-detection
+            sample_size=15,
+            max_auto_columns=50  # User can control auto-detection limit
         )
         
-        if results:
-            validator.print_streaming_validation_report(results)
+        # If found sample mismatches, proceed with full validation
+        if sample_mismatches:
+            print(f"\n STEP 2: Running memory-optimized validation (found {len(sample_mismatches)} sample mismatches)...")
             
-            # Show how to query the results
-            if results.get('created_tables'):
-                print(f"\n" + "="*80)
-                print("SAMPLE QUERIES FOR RESULT ANALYSIS")
-                print("="*80)
-                
-                tables = results['created_tables']
-                
-                if 'mismatches' in tables:
-                    print(f"\n-- Query mismatches by column:")
-                    print(f"SELECT COLUMN_NAME, COUNT(*) as MISMATCH_COUNT")
-                    print(f"FROM {tables['mismatches']}")
-                    print(f"GROUP BY COLUMN_NAME")
-                    print(f"ORDER BY MISMATCH_COUNT DESC;")
-                    
-                    print(f"\n-- Sample mismatches for specific column:")
-                    print(f"SELECT * FROM {tables['mismatches']}")
-                    print(f"WHERE COLUMN_NAME = 'YOUR_COLUMN_NAME'")
-                    print(f"LIMIT 10;")
-                
-                if 'SQL_only' in tables:
-                    print(f"\n-- Count of SQL-only records:")
-                    print(f"SELECT COUNT(*) FROM {tables['SQL_only']};")
-                
-                if 'MDP_only' in tables:
-                    print(f"\n-- Count of MDP-only records:")
-                    print(f"SELECT COUNT(*) FROM {tables['MDP_only']};")
+            results = validator.validate_tables(
+                table1_name='BCBSND_CONFORMED_DEV.OUTBOUND.MEMBER_ENROLLMENT_MASTER',
+                table2_name='BCBSND_CONFORMED_DEV.OUTBOUND.MEMBER_ENROLLMENT_MASTER_PROD',
+                primary_key_columns=['MEMBER_ID'],
+                comparison_columns=None,  # Specify columns like ['COLUMN1', 'COLUMN2'] or None for auto-detect
+                table1_alias='SQL',
+                table2_alias='MDP',
+                environment='SNOWFLAKE',
+                create_tables=True,      # Set to True to create tables with ALL results
+                stage_name='@~/',
+                max_sample_size=False,   # False=ALL RECORDS (streaming), None=auto-decide, int=specific limit
+                max_auto_columns=77      # Control auto-detection limit
+            )
             
-            return results
+            if results:
+                validator.print_validation_report(results)
+                return results
+            else:
+                print(" Full validation failed to complete")
+                return None
         else:
-            print("❌ Streaming validation failed to complete")
-            return None
+            print(" No mismatches found in sample - tables appear to match perfectly!")
+            print("You can still run the full validation if needed.")
+            return {'status': 'no_mismatches_in_sample'}
             
     except Exception as e:
-        print(f"❌ Error during streaming validation: {str(e)}")
-        logging.error(f"Streaming validation error: {str(e)}")
+        print(f" Error during validation: {str(e)}")
+        logging.error(f"Validation error: {str(e)}")
         return None
 
 
-# Example usage patterns:
-
-def example_usage():
-    """
-    Examples of different usage patterns for the streaming validator
-    """
-    
-    # Example 1: Complete validation with all columns
-    print("# Example 1: Complete validation")
-    print("""
-validator = StreamingTableValidator()
-results = validator.validate_tables_streaming(
-    table1_name='DB.SCHEMA.TABLE1',
-    table2_name='DB.SCHEMA.TABLE2',
-    primary_key_columns=['ID'],
-    comparison_columns=None,  # Auto-detect all columns
-    create_tables=True,       # Get ALL results in tables
-    create_stage_files=True   # Get ALL results in CSV files
-)
-    """)
-    
-    # Example 2: Specific columns only
-    print("\n# Example 2: Specific columns validation")
-    print("""
-results = validator.validate_tables_streaming(
-    table1_name='DB.SCHEMA.TABLE1',
-    table2_name='DB.SCHEMA.TABLE2',
-    primary_key_columns=['MEMBER_ID'],
-    comparison_columns=['NAME', 'EMAIL', 'PHONE'],  # Only these columns
-    table1_alias='DEV',
-    table2_alias='PROD'
-)
-    """)
-    
-    # Example 3: Large table optimization
-    print("\n# Example 3: Large table with column limit")
-    print("""
-results = validator.validate_tables_streaming(
-    table1_name='DB.SCHEMA.HUGE_TABLE1',
-    table2_name='DB.SCHEMA.HUGE_TABLE2',
-    primary_key_columns=['ID1', 'ID2'],  # Composite key
-    max_auto_columns=20,  # Limit auto-detection to first 20 columns
-    create_tables=True    # Still gets ALL records, just fewer columns
-)
-    """)
-
-
 if __name__ == "__main__":
-    main_streaming()
+    main()
