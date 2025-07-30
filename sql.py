@@ -1,4 +1,16 @@
-# The Snowpark package is required for Python Worksheets. 
+def validate_tables_sp(session: Session, 
+                      table1_name: str, 
+                      table2_name: str,
+                      primary_key_columns: str = None,
+                      comparison_columns: str = None,
+                      table1_alias: str = "SQL",
+                      table2_alias: str = "MDP", 
+                      environment: str = "SNOWFLAKE",
+                      create_tables: bool = True,
+                      stage_name: str = "@~/",
+                      target_schema: str = None,
+                      max_sample_size = None,
+                      max_auto_columns: int = None) -> str:# The Snowpark package is required for Python Worksheets. 
 # You can add more packages by selecting them using the Packages control and then importing them.
 
 import snowflake.snowpark as snowpark
@@ -687,6 +699,7 @@ class GenericTableValidator:
                        environment: str = "SNOWFLAKE",
                        create_tables: bool = True,
                        stage_name: str = "@~/",
+                       target_schema: str = None,
                        max_sample_size = None,
                        max_auto_columns: int = None) -> Dict[str, Any]:
         """
@@ -702,6 +715,7 @@ class GenericTableValidator:
             environment: Environment name
             create_tables: Whether to create result tables
             stage_name: Snowflake stage for output files
+            target_schema: Schema where result tables should be created (if None, uses same schema as table1)
             max_sample_size: None=auto-decide, int=specific limit, False=unlimited (user-controllable)
             max_auto_columns: None=default(50), int=user-specified limit for auto-detection
             
@@ -723,165 +737,281 @@ class GenericTableValidator:
             final_max_auto_columns = 50  # Default
         else:
             final_max_auto_columns = max_auto_columns
-            
+        
+        # Determine target schema for result tables
+        if target_schema is None:
+            # Extract schema from table1_name (e.g., "DB.SCHEMA.TABLE" -> "DB.SCHEMA")
+            table_parts = table1_name.split('.')
+            if len(table_parts) >= 2:
+                target_schema = '.'.join(table_parts[:-1])
+            else:
+                target_schema = "PUBLIC"  # Default fallback
+        
         self.logger.info("="*80)
         self.logger.info("STARTING MEMORY-OPTIMIZED TABLE VALIDATION")
         self.logger.info("="*80)
         self.logger.info(f"Table 1 ({table1_alias}): {table1_name}")
         self.logger.info(f"Table 2 ({table2_alias}): {table2_name}")
         self.logger.info(f"Environment: {environment}")
+        self.logger.info(f"Target Schema: {target_schema}")
         self.logger.info(f"Primary Key Columns: {primary_key_columns}")
         self.logger.info(f"Comparison Columns: {comparison_columns if comparison_columns else f'Auto-detect (max {final_max_auto_columns})'}")
         self.logger.info(f"Max Sample Size: {'Auto-decided' if max_sample_size is None else ('False (unlimited)' if final_max_sample_size is False else final_max_sample_size)}")
         self.logger.info(f"Timestamp: {self.timestamp}")
         
-        # Determine if user specified columns
-        user_specified_columns = comparison_columns is not None
-        
-        # Get table information
-        table1_info = self.get_table_info(table1_name)
-        table2_info = self.get_table_info(table2_name)
-        if not table1_info or not table2_info:
-            self.logger.error("Failed to get table information")
-            return None
-        
-        # Validate table compatibility
-        validation_issues = self.validate_table_compatibility(table1_info, table2_info)
-        critical_issues = [issue for issue in validation_issues if issue.get('severity') == 'CRITICAL']
-        if critical_issues:
-            self.logger.error("Critical validation issues found - cannot proceed with data comparison")
-            return {
-                'validation_status': 'FAILED',
-                'critical_issues': critical_issues,
-                'validation_issues': validation_issues
-            }
-        
-        # Identify primary key columns
-        pk_columns = self.identify_primary_key_columns(table1_info, table2_info, primary_key_columns)
-        if not pk_columns:
-            self.logger.error("No valid primary key columns identified")
-            return None
-        
-        # Identify comparison columns
-        comp_columns = self.identify_comparison_columns(table1_info, table2_info, pk_columns, comparison_columns, final_max_auto_columns)
-        if not comp_columns:
-            self.logger.error("No valid comparison columns identified")
-            return None
-        
-        # Run memory-optimized comparison
-        mismatched_rows, table1_only_rows, table2_only_rows, summary_stats = self.compare_tables_memory_optimized(
-            table1_name, table2_name, pk_columns, comp_columns, table1_alias, table2_alias, final_max_sample_size, user_specified_columns
-        )
-        
-        # Handle streaming mode results
-        is_streaming_mode = summary_stats.get('memory_strategy') == 'streaming-all-records'
-        
-        # Generate output file names
-        mismatch_table_name = f"TABLE_VALIDATION_MISMATCHES_{table1_alias}_VS_{table2_alias}_{self.timestamp}"
-        table1_only_table_name = f"TABLE_VALIDATION_{table1_alias}_ONLY_{self.timestamp}"
-        table2_only_table_name = f"TABLE_VALIDATION_{table2_alias}_ONLY_{self.timestamp}"
-        mismatch_csv = f"table_validation_mismatches_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
-        table1_only_csv = f"table_validation_{table1_alias}_only_{self.timestamp}.csv"
-        table2_only_csv = f"table_validation_{table2_alias}_only_{self.timestamp}.csv"
-        summary_csv = f"table_validation_summary_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
-        
-        # Create tables if requested
-        created_tables = {}
-        if create_tables:
-            if is_streaming_mode:
-                # In streaming mode, copy from temp tables to permanent tables
-                temp_tables = summary_stats.get('temp_tables', {})
-                
-                if temp_tables.get('mismatches') and summary_stats['mismatched_data_points'] > 0:
-                    self.session.sql(f"""
-                        CREATE OR REPLACE TABLE {mismatch_table_name} AS
-                        SELECT * FROM {temp_tables['mismatches']}
-                    """).collect()
-                    created_tables['mismatches'] = mismatch_table_name
-                    self.logger.info(f"Created permanent table: {mismatch_table_name} with {summary_stats['mismatched_data_points']:,} rows")
-                
-                if temp_tables.get('table1_only') and summary_stats['rows_only_in_table1'] > 0:
-                    self.session.sql(f"""
-                        CREATE OR REPLACE TABLE {table1_only_table_name} AS
-                        SELECT * FROM {temp_tables['table1_only']}
-                    """).collect()
-                    created_tables[f'{table1_alias}_only'] = table1_only_table_name
-                    self.logger.info(f"Created permanent table: {table1_only_table_name} with {summary_stats['rows_only_in_table1']:,} rows")
-                
-                if temp_tables.get('table2_only') and summary_stats['rows_only_in_table2'] > 0:
-                    self.session.sql(f"""
-                        CREATE OR REPLACE TABLE {table2_only_table_name} AS
-                        SELECT * FROM {temp_tables['table2_only']}
-                    """).collect()
-                    created_tables[f'{table2_alias}_only'] = table2_only_table_name
-                    self.logger.info(f"Created permanent table: {table2_only_table_name} with {summary_stats['rows_only_in_table2']:,} rows")
-            else:
-                # Original approach for sampled data
-                if mismatched_rows:
-                    self.create_snowflake_table(mismatch_table_name, mismatched_rows)
-                    created_tables['mismatches'] = mismatch_table_name
-                if table1_only_rows:
-                    self.create_snowflake_table(table1_only_table_name, table1_only_rows)
-                    created_tables[f'{table1_alias}_only'] = table1_only_table_name
-                if table2_only_rows:
-                    self.create_snowflake_table(table2_only_table_name, table2_only_rows)
-                    created_tables[f'{table2_alias}_only'] = table2_only_table_name
-        
-        # Write to stage files
-        stage_files = {}
-        if is_streaming_mode:
-            # In streaming mode, export directly from temp tables
-            temp_tables = summary_stats.get('temp_tables', {})
-            self._write_streaming_stage_files(temp_tables, stage_name, table1_alias, table2_alias, summary_stats)
-            stage_files = {
-                'mismatches': f"{stage_name}{mismatch_csv}",
-                f'{table1_alias}_only': f"{stage_name}{table1_only_csv}",
-                f'{table2_alias}_only': f"{stage_name}{table2_only_csv}",
-                'summary': f"{stage_name}{summary_csv}"
-            }
-        else:
-            # Original approach for sampled data
-            if mismatched_rows:
-                self.write_to_snowflake_stage(mismatched_rows, mismatch_csv, stage_name)
-                stage_files['mismatches'] = f"{stage_name}{mismatch_csv}"
-            if table1_only_rows:
-                self.write_to_snowflake_stage(table1_only_rows, table1_only_csv, stage_name)
-                stage_files[f'{table1_alias}_only'] = f"{stage_name}{table1_only_csv}"
-            if table2_only_rows:
-                self.write_to_snowflake_stage(table2_only_rows, table2_only_csv, stage_name)
-                stage_files[f'{table2_alias}_only'] = f"{stage_name}{table2_only_csv}"
-            
-            self.write_to_snowflake_stage([summary_stats], summary_csv, stage_name)
-            stage_files['summary'] = f"{stage_name}{summary_csv}"
-        
-        # Determine validation status
-        validation_passed = (
-            summary_stats.get('mismatched_rows_count', len(mismatched_rows)) == 0 and 
-            summary_stats.get('rows_only_in_table1', len(table1_only_rows)) == 0 and 
-            summary_stats.get('rows_only_in_table2', len(table2_only_rows)) == 0 and
-            len(validation_issues) == 0
-        )
-        
-        # Build results
+        # Initialize results structure early to ensure we always return something
         results = {
-            'validation_status': 'PASSED' if validation_passed else 'FAILED',
+            'validation_status': 'IN_PROGRESS',
             'timestamp': self.timestamp,
             'environment': environment,
-            'table1_info': table1_info,
-            'table2_info': table2_info,
-            'validation_issues': validation_issues,
-            'summary_statistics': summary_stats,
-            'results_summary': {
-                'mismatched_rows_count': summary_stats.get('mismatched_rows_count', len(mismatched_rows)),
-                f'{table1_alias}_only_rows_count': summary_stats.get('rows_only_in_table1', len(table1_only_rows)),
-                f'{table2_alias}_only_rows_count': summary_stats.get('rows_only_in_table2', len(table2_only_rows)),
-                'total_issues_found': summary_stats.get('mismatched_rows_count', len(mismatched_rows)) + summary_stats.get('rows_only_in_table1', len(table1_only_rows)) + summary_stats.get('rows_only_in_table2', len(table2_only_rows))
-            },
-            'created_tables': created_tables if create_tables else None,
-            'stage_files': stage_files
+            'table1_info': None,
+            'table2_info': None,
+            'validation_issues': [],
+            'summary_statistics': {},
+            'results_summary': {},
+            'created_tables': {},
+            'stage_files': {},
+            'error_details': None
         }
         
-        return results
+        try:
+            # Determine if user specified columns
+            user_specified_columns = comparison_columns is not None
+            
+            # Get table information
+            table1_info = self.get_table_info(table1_name)
+            table2_info = self.get_table_info(table2_name)
+            if not table1_info or not table2_info:
+                self.logger.error("Failed to get table information")
+                results.update({
+                    'validation_status': 'FAILED',
+                    'error_details': 'Failed to get table information - check table names and permissions'
+                })
+                return results
+            
+            results['table1_info'] = table1_info
+            results['table2_info'] = table2_info
+            
+            # Validate table compatibility
+            validation_issues = self.validate_table_compatibility(table1_info, table2_info)
+            results['validation_issues'] = validation_issues
+            critical_issues = [issue for issue in validation_issues if issue.get('severity') == 'CRITICAL']
+            if critical_issues:
+                self.logger.error("Critical validation issues found - cannot proceed with data comparison")
+                results.update({
+                    'validation_status': 'FAILED',
+                    'critical_issues': critical_issues,
+                    'error_details': f'Critical validation issues: {[issue["type"] for issue in critical_issues]}'
+                })
+                return results
+            
+            # Identify primary key columns
+            pk_columns = self.identify_primary_key_columns(table1_info, table2_info, primary_key_columns)
+            if not pk_columns:
+                self.logger.error("No valid primary key columns identified")
+                results.update({
+                    'validation_status': 'FAILED',
+                    'error_details': 'No valid primary key columns identified'
+                })
+                return results
+            
+            # Identify comparison columns
+            comp_columns = self.identify_comparison_columns(table1_info, table2_info, pk_columns, comparison_columns, final_max_auto_columns)
+            if not comp_columns:
+                self.logger.error("No valid comparison columns identified")
+                results.update({
+                    'validation_status': 'FAILED',
+                    'error_details': 'No valid comparison columns identified'
+                })
+                return results
+            
+            # Run memory-optimized comparison
+            mismatched_rows, table1_only_rows, table2_only_rows, summary_stats = self.compare_tables_memory_optimized(
+                table1_name, table2_name, pk_columns, comp_columns, table1_alias, table2_alias, final_max_sample_size, user_specified_columns
+            )
+            
+            results['summary_statistics'] = summary_stats
+            
+            # Handle streaming mode results
+            is_streaming_mode = summary_stats.get('memory_strategy') == 'streaming-all-records'
+            
+            # Generate output file names with target schema
+            mismatch_table_name = f"{target_schema}.TABLE_VALIDATION_MISMATCHES_{table1_alias}_VS_{table2_alias}_{self.timestamp}"
+            table1_only_table_name = f"{target_schema}.TABLE_VALIDATION_{table1_alias}_ONLY_{self.timestamp}"
+            table2_only_table_name = f"{target_schema}.TABLE_VALIDATION_{table2_alias}_ONLY_{self.timestamp}"
+            mismatch_csv = f"table_validation_mismatches_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
+            table1_only_csv = f"table_validation_{table1_alias}_only_{self.timestamp}.csv"
+            table2_only_csv = f"table_validation_{table2_alias}_only_{self.timestamp}.csv"
+            summary_csv = f"table_validation_summary_{table1_alias}_vs_{table2_alias}_{self.timestamp}.csv"
+            
+            # Create tables if requested
+            created_tables = {}
+            table_creation_errors = []
+            
+            if create_tables:
+                try:
+                    if is_streaming_mode:
+                        # In streaming mode, copy from temp tables to permanent tables
+                        temp_tables = summary_stats.get('temp_tables', {})
+                        
+                        if temp_tables.get('mismatches') and summary_stats['mismatched_data_points'] > 0:
+                            try:
+                                self.session.sql(f"""
+                                    CREATE OR REPLACE TABLE {mismatch_table_name} AS
+                                    SELECT * FROM {temp_tables['mismatches']}
+                                """).collect()
+                                created_tables['mismatches'] = mismatch_table_name
+                                self.logger.info(f"Created permanent table: {mismatch_table_name} with {summary_stats['mismatched_data_points']:,} rows")
+                            except Exception as e:
+                                table_creation_errors.append(f"mismatches table: {str(e)}")
+                                self.logger.warning(f"Failed to create mismatches table: {str(e)}")
+                        
+                        if temp_tables.get('table1_only') and summary_stats['rows_only_in_table1'] > 0:
+                            try:
+                                self.session.sql(f"""
+                                    CREATE OR REPLACE TABLE {table1_only_table_name} AS
+                                    SELECT * FROM {temp_tables['table1_only']}
+                                """).collect()
+                                created_tables[f'{table1_alias}_only'] = table1_only_table_name
+                                self.logger.info(f"Created permanent table: {table1_only_table_name} with {summary_stats['rows_only_in_table1']:,} rows")
+                            except Exception as e:
+                                table_creation_errors.append(f"{table1_alias}_only table: {str(e)}")
+                                self.logger.warning(f"Failed to create {table1_alias}_only table: {str(e)}")
+                        
+                        if temp_tables.get('table2_only') and summary_stats['rows_only_in_table2'] > 0:
+                            try:
+                                self.session.sql(f"""
+                                    CREATE OR REPLACE TABLE {table2_only_table_name} AS
+                                    SELECT * FROM {temp_tables['table2_only']}
+                                """).collect()
+                                created_tables[f'{table2_alias}_only'] = table2_only_table_name
+                                self.logger.info(f"Created permanent table: {table2_only_table_name} with {summary_stats['rows_only_in_table2']:,} rows")
+                            except Exception as e:
+                                table_creation_errors.append(f"{table2_alias}_only table: {str(e)}")
+                                self.logger.warning(f"Failed to create {table2_alias}_only table: {str(e)}")
+                    else:
+                        # Original approach for sampled data
+                        if mismatched_rows:
+                            try:
+                                self.create_snowflake_table(mismatch_table_name, mismatched_rows)
+                                created_tables['mismatches'] = mismatch_table_name
+                            except Exception as e:
+                                table_creation_errors.append(f"mismatches table: {str(e)}")
+                                self.logger.warning(f"Failed to create mismatches table: {str(e)}")
+                        if table1_only_rows:
+                            try:
+                                self.create_snowflake_table(table1_only_table_name, table1_only_rows)
+                                created_tables[f'{table1_alias}_only'] = table1_only_table_name
+                            except Exception as e:
+                                table_creation_errors.append(f"{table1_alias}_only table: {str(e)}")
+                                self.logger.warning(f"Failed to create {table1_alias}_only table: {str(e)}")
+                        if table2_only_rows:
+                            try:
+                                self.create_snowflake_table(table2_only_table_name, table2_only_rows)
+                                created_tables[f'{table2_alias}_only'] = table2_only_table_name
+                            except Exception as e:
+                                table_creation_errors.append(f"{table2_alias}_only table: {str(e)}")
+                                self.logger.warning(f"Failed to create {table2_alias}_only table: {str(e)}")
+                                
+                except Exception as e:
+                    self.logger.error(f"Error during table creation: {str(e)}")
+                    table_creation_errors.append(f"General table creation error: {str(e)}")
+            
+            results['created_tables'] = created_tables
+            if table_creation_errors:
+                results['table_creation_errors'] = table_creation_errors
+            
+            # Write to stage files
+            stage_files = {}
+            stage_creation_errors = []
+            
+            try:
+                if is_streaming_mode:
+                    # In streaming mode, export directly from temp tables
+                    temp_tables = summary_stats.get('temp_tables', {})
+                    self._write_streaming_stage_files(temp_tables, stage_name, table1_alias, table2_alias, summary_stats)
+                    stage_files = {
+                        'mismatches': f"{stage_name}{mismatch_csv}",
+                        f'{table1_alias}_only': f"{stage_name}{table1_only_csv}",
+                        f'{table2_alias}_only': f"{stage_name}{table2_only_csv}",
+                        'summary': f"{stage_name}{summary_csv}"
+                    }
+                else:
+                    # Original approach for sampled data
+                    try:
+                        if mismatched_rows:
+                            self.write_to_snowflake_stage(mismatched_rows, mismatch_csv, stage_name)
+                            stage_files['mismatches'] = f"{stage_name}{mismatch_csv}"
+                        if table1_only_rows:
+                            self.write_to_snowflake_stage(table1_only_rows, table1_only_csv, stage_name)
+                            stage_files[f'{table1_alias}_only'] = f"{stage_name}{table1_only_csv}"
+                        if table2_only_rows:
+                            self.write_to_snowflake_stage(table2_only_rows, table2_only_csv, stage_name)
+                            stage_files[f'{table2_alias}_only'] = f"{stage_name}{table2_only_csv}"
+                        
+                        self.write_to_snowflake_stage([summary_stats], summary_csv, stage_name)
+                        stage_files['summary'] = f"{stage_name}{summary_csv}"
+                    except Exception as e:
+                        stage_creation_errors.append(f"Stage file creation error: {str(e)}")
+                        self.logger.warning(f"Error creating stage files: {str(e)}")
+                        
+            except Exception as e:
+                stage_creation_errors.append(f"General stage error: {str(e)}")
+                self.logger.warning(f"Error during stage file creation: {str(e)}")
+            
+            results['stage_files'] = stage_files
+            if stage_creation_errors:
+                results['stage_creation_errors'] = stage_creation_errors
+            
+            # Determine validation status based on data, not just table creation
+            mismatched_count = summary_stats.get('mismatched_rows_count', len(mismatched_rows))
+            table1_only_count = summary_stats.get('rows_only_in_table1', len(table1_only_rows))
+            table2_only_count = summary_stats.get('rows_only_in_table2', len(table2_only_rows))
+            
+            validation_passed = (
+                mismatched_count == 0 and 
+                table1_only_count == 0 and 
+                table2_only_count == 0 and
+                len(validation_issues) == 0
+            )
+            
+            # Update results with final status
+            results.update({
+                'validation_status': 'PASSED' if validation_passed else 'FAILED',
+                'results_summary': {
+                    'mismatched_rows_count': mismatched_count,
+                    f'{table1_alias}_only_rows_count': table1_only_count,
+                    f'{table2_alias}_only_rows_count': table2_only_count,
+                    'total_issues_found': mismatched_count + table1_only_count + table2_only_count
+                }
+            })
+            
+            # Add success details
+            if validation_passed:
+                results['success_details'] = 'Tables match perfectly - no differences found'
+            else:
+                issues_found = []
+                if mismatched_count > 0:
+                    issues_found.append(f"{mismatched_count:,} mismatched rows")
+                if table1_only_count > 0:
+                    issues_found.append(f"{table1_only_count:,} {table1_alias}-only rows")
+                if table2_only_count > 0:
+                    issues_found.append(f"{table2_only_count:,} {table2_alias}-only rows")
+                results['failure_details'] = f'Differences found: {", ".join(issues_found)}'
+            
+            self.logger.info(f"✅ VALIDATION COMPLETED: {results['validation_status']}")
+            if results['validation_status'] == 'FAILED':
+                self.logger.info(f"   Reason: {results.get('failure_details', 'See results for details')}")
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Error during table validation: {str(e)}")
+            results.update({
+                'validation_status': 'ERROR',
+                'error_details': f'Unexpected error during validation: {str(e)}'
+            })
+            return results
 
     def _write_streaming_stage_files(self, temp_tables: Dict, stage_name: str, table1_alias: str, table2_alias: str, summary_stats: Dict):
         """
@@ -1198,9 +1328,8 @@ def validate_tables_sp(session: Session,
                       create_tables: bool = True,
                       stage_name: str = "@~/",
                       max_sample_size = None,
-                      max_auto_columns: int = None) -> str:
     """
-    Stored procedure version with smart sampling logic
+    Stored procedure version with smart sampling logic and target schema support
     
     Args:
         session: Snowpark session
@@ -1213,6 +1342,7 @@ def validate_tables_sp(session: Session,
         environment: Database environment
         create_tables: Whether to create result tables
         stage_name: Snowflake stage for output files
+        target_schema: Schema where result tables should be created (e.g., 'PUBLIC', 'DEV_SCHEMA')
         max_sample_size: None=auto-decide, int=specific limit, False=unlimited (user-controllable)
         max_auto_columns: None=default(50), int=user-specified limit for auto-detection
     
@@ -1249,7 +1379,7 @@ def validate_tables_sp(session: Session,
         # Create validator
         validator = GenericTableValidator(session)
         
-        # Run memory-optimized validation
+        # Run memory-optimized validation with target schema
         results = validator.validate_tables(
             table1_name=table1_name,
             table2_name=table2_name,
@@ -1260,32 +1390,54 @@ def validate_tables_sp(session: Session,
             environment=environment,
             create_tables=create_tables,
             stage_name=stage_name,
+            target_schema=target_schema,
             max_sample_size=final_max_sample_size,
             max_auto_columns=final_max_auto_columns
         )
         
-        if results:
+        if results and results.get('validation_status') != 'ERROR':
             summary = results['results_summary']
             stats = results['summary_statistics']
             table1_alias = stats['table1_alias']
             table2_alias = stats['table2_alias']
             
+            # Format the response based on validation status
+            status_line = f"Table Validation {results['validation_status']}"
+            if results['validation_status'] == 'FAILED':
+                if 'failure_details' in results:
+                    status_line += f" - {results['failure_details']}"
+            elif results['validation_status'] == 'PASSED':
+                if 'success_details' in results:
+                    status_line += f" - {results['success_details']}"
+            
+            # Include any errors that occurred but didn't fail the validation
+            error_notes = []
+            if 'table_creation_errors' in results:
+                error_notes.append(f"Table creation issues: {len(results['table_creation_errors'])}")
+            if 'stage_creation_errors' in results:
+                error_notes.append(f"Stage file issues: {len(results['stage_creation_errors'])}")
+            
+            error_summary = f"\nNotes: {', '.join(error_notes)}" if error_notes else ""
+            
             return f"""
-                    Table Validation {results['validation_status']}
-                    Environment: {results['environment']}
-                    {table1_alias} ({stats['table1_name']}): {stats['total_table1_rows']:,} rows
-                    {table2_alias} ({stats['table2_name']}): {stats['total_table2_rows']:,} rows
-                    Mismatches: {summary['mismatched_rows_count']:,}
-                    {table1_alias} Only: {summary[f'{table1_alias}_only_rows_count']:,}
-                    {table2_alias} Only: {summary[f'{table2_alias}_only_rows_count']:,}
-                    Total Issues: {summary['total_issues_found']:,}
-                    Primary Keys: {', '.join(stats['primary_key_columns'])}
-                    Comparison Columns: {stats['total_comparison_columns']}
-                    Memory Strategy: {stats.get('memory_strategy', 'default')}
-                    Sample Size: {stats['max_sample_size']}
-                                """.strip()
+{status_line}
+Environment: {results['environment']}
+{table1_alias} ({stats['table1_name']}): {stats['total_table1_rows']:,} rows
+{table2_alias} ({stats['table2_name']}): {stats['total_table2_rows']:,} rows
+Mismatched Rows: {summary['mismatched_rows_count']:,}
+{table1_alias} Only: {summary[f'{table1_alias}_only_rows_count']:,}
+{table2_alias} Only: {summary[f'{table2_alias}_only_rows_count']:,}
+Total Issues: {summary['total_issues_found']:,}
+Primary Keys: {', '.join(stats['primary_key_columns'])}
+Comparison Columns: {stats['total_comparison_columns']}
+Memory Strategy: {stats.get('memory_strategy', 'default')}
+Sample Size: {stats['max_sample_size']}
+Created Tables: {len(results.get('created_tables', {}))}
+Stage Files: {len(results.get('stage_files', {}))}{error_summary}
+                    """.strip()
         else:
-            return "Table validation failed to complete"
+            error_msg = results.get('error_details', 'Unknown error') if results else 'Validation returned no results'
+            return f"Table validation FAILED - {error_msg}"
             
     except Exception as e:
         return f"Error during table validation: {str(e)}"
@@ -1325,6 +1477,7 @@ def main():
                 environment='SNOWFLAKE',
                 create_tables=True,      # Set to True to create tables with ALL results
                 stage_name='@~/',
+                target_schema='PUBLIC',  # Use PUBLIC schema or specify your writable schema
                 max_sample_size=False,   # False=ALL RECORDS (streaming), None=auto-decide, int=specific limit
                 max_auto_columns=77      # Control auto-detection limit
             )
