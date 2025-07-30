@@ -1,18 +1,3 @@
-def validate_tables_sp(session: Session, 
-                      table1_name: str, 
-                      table2_name: str,
-                      primary_key_columns: str = None,
-                      comparison_columns: str = None,
-                      table1_alias: str = "SQL",
-                      table2_alias: str = "MDP", 
-                      environment: str = "SNOWFLAKE",
-                      create_tables: bool = True,
-                      stage_name: str = "@~/",
-                      target_schema: str = None,
-                      max_sample_size = None,
-                      max_auto_columns: int = None) -> str:# The Snowpark package is required for Python Worksheets. 
-# You can add more packages by selecting them using the Packages control and then importing them.
-
 import snowflake.snowpark as snowpark
 import pandas as pd
 from snowflake.snowpark import Session
@@ -1327,7 +1312,7 @@ def validate_tables_sp(session: Session,
                       environment: str = "SNOWFLAKE",
                       create_tables: bool = True,
                       stage_name: str = "@~/",
-                      max_sample_size = None,
+                      max_sample_size = None,):
     """
     Stored procedure version with smart sampling logic and target schema support
     
